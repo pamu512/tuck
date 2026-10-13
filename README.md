@@ -89,3 +89,12 @@ State machine: invite -> uploads -> exclusions acknowledged -> preview -> candid
 ## Scope of v0
 
 No LLM, no vision model, no accounts, no external storage. One job: a safe, invite-first path from family memories to culturally relevant candidates.
+
+## Deploy on Render
+
+Blueprint: `render.yaml`.
+
+- Build: `pip install -r requirements.txt`
+- Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+
+Set `QLOO_API_KEY` in the Render Dashboard. The blueprint names the variable only; never commit the value.
