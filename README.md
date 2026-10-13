@@ -28,7 +28,7 @@ These lists are enforced in code (`app/session.py`), not just documented: the cl
 ## Safety invariants and where they live
 
 1. Invite-first. `POST /invites` issues a one-time token; every session route requires it (`X-Invite-Token` header). Tokens are stored as SHA-256 hashes and compared in constant time.
-2. Exclusions before any Qloo call. `POST /sessions/{id}/preview` and `POST /sessions/{id}/candidates` refuse with 409 until `POST /sessions/{id}/exclusions` has run. An empty list counts as a deliberate acknowledgment; changing exclusions later invalidates the preview so it must be re-signed. Exclusions filter both the signals sent to Qloo and the candidates returned.
+2. Exclusions before any recommendation. `POST /sessions/{id}/preview` and `POST /sessions/{id}/candidates` refuse with 409 until `POST /sessions/{id}/exclusions` has run. An empty list counts as a deliberate acknowledgment; changing exclusions later invalidates the preview so it must be re-signed. Acknowledgment tries to resolve each label to a Qloo tag or entity id (`search_tags` / `search_entities`) and filters on that id when it hits. Labels that do not resolve are returned in `unresolved_exclusions` and still filter by name, which can miss paraphrases. Exclusions filter both the signals sent to Qloo and the candidates returned.
 3. Photos are opaque. The photo path is stored as a metadata string. It is never opened, read, or analyzed; there is no vision model anywhere. `tests/test_no_invented_bio.py` sabotages `open()` for image files and proves the full flow still works.
 4. Anecdotes are display-only. Anecdote text stays in the local family record and is never sent to Qloo. Qloo signals come exclusively from caregiver-typed interests. Interests that do not resolve to a Qloo tag or entity are reported as unresolved, never guessed.
 5. Preview is the sign-off. Preview shows the exact signal IDs Qloo will receive, what is withheld by exclusions, and the claim boundary, before candidates are requested.
@@ -56,7 +56,7 @@ Notes verified against the live API and the hackathon developer guide:
     pip install -r requirements.txt
     uvicorn app.main:app --port 8000
 
-The server needs the key only when a preview or candidates call is made (it returns a clean 503 otherwise).
+Preview and candidates need the key (503 if it is missing). Exclusion acknowledgment also tries Qloo; if that lookup fails, the labels are still saved and listed in `unresolved_exclusions`.
 
 ## Demo CLI
 
@@ -65,7 +65,7 @@ The server needs the key only when a preview or candidates call is made (it retu
 
 ## Tests
 
-    pytest tests/test_exclusions.py tests/test_no_invented_bio.py
+    pytest tests/
 
 No network, no API key: tests inject a canned Qloo double and a temporary store. The real client's wire behavior (GET method, query params, biography stripping) is covered through an httpx mock transport.
 
@@ -75,15 +75,26 @@ No network, no API key: tests inject a canned Qloo double and a temporary store.
 | --- | --- | --- |
 | POST /invites | `{"caregiver_label"}` | session ID plus one-time invite token |
 | POST /sessions/{id}/uploads | `{"photo_path", "anecdote", "interests"}` | upload receipt; photo never opened |
-| POST /sessions/{id}/exclusions | `{"exclusions": [{"label", "kind", "reason"}]}` | acknowledgment (empty list allowed) |
+| POST /sessions/{id}/exclusions | `{"exclusions": [{"label", "kind", "reason"}]}` | acknowledgment (empty list allowed); unresolved labels are listed |
 | POST /sessions/{id}/preview | none | exact signals Qloo will receive, withheld items, claims |
-| POST /sessions/{id}/candidates | none | filtered music/film/place candidates with reasons |
+| POST /sessions/{id}/candidates | none | filtered music/film/place candidates with reasons; session is then deleted |
+| DELETE /sessions/{id} | none | delete the session and its anecdotes before completion |
 
-State machine: invite -> uploads -> exclusions acknowledged -> preview -> candidates, enforced server-side.
+State machine: invite -> uploads -> exclusions acknowledged -> preview -> candidates, enforced server-side. A successful candidates response deletes the session. `DELETE /sessions/{id}` does the same earlier. Both require `X-Invite-Token`.
+
+## Public demo retention
+
+Sessions are anecdotes and photo paths, so the public demo does not keep them indefinitely.
+
+- TTL is 24 hours (`GML_SESSION_TTL_SECONDS`, positive integer). An expired session is deleted on the next read or when a new invite is created, and then answers 404.
+- At most 200 sessions are stored (`GML_MAX_SESSIONS`). A new invite past that cap returns 429. Expired rows are dropped first and do not consume the cap.
+- `POST /sessions/{id}/candidates` deletes the session after a successful response. A 409 or 502 leaves it in place so the caregiver can fix the request. `DELETE /sessions/{id}` removes it sooner.
+
+There is no per-IP rate limit on `POST /invites`. The cap and TTL bound how much the file can grow.
 
 ## Storage and secrets
 
-- Sessions live in a local JSON file (`data/store.json`, override with `GML_STORE_PATH`). Atomic writes, lock-guarded. This is a demo store, not a production data layer: no encryption at rest, no multi-process coordination.
+- Sessions live in a local JSON file (`data/store.json`, override with `GML_STORE_PATH`). Writes are atomic. Each session's load → mutate → put runs under a stripe lock, so overlapping uploads or exclusion updates on that session cannot drop a write. This is a demo store, not a production data layer: no encryption at rest, no multi-process coordination.
 - `.env.example` documents the key name only. The real key lives outside the repo at `~/.config/ax/secrets/qloo-hackathon.env`.
 
 ## Scope of v0

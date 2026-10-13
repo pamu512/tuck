@@ -159,8 +159,15 @@ def run_flow(http: Any) -> int:
     )
     if response.status_code != 200:
         return _fail("exclusions", response)
+    recorded = response.json()
     for exclusion in DEMO["exclusions"]:
         say(f"excluded     {exclusion['label']} ({exclusion['kind']}) - {exclusion['reason']}")
+    if recorded.get("unresolved_exclusions"):
+        say(
+            "unresolved   "
+            + ", ".join(recorded["unresolved_exclusions"])
+            + " (no Qloo id; name match only, paraphrases can slip through)"
+        )
 
     banner("STEP 4 of 5: caregiver preview (first Qloo touch)")
     response = http.post(f"/sessions/{invite['session_id']}/preview", headers=headers)
@@ -183,6 +190,12 @@ def run_flow(http: Any) -> int:
     for candidate in body["candidates"]:
         say(f"[{candidate['type']:>5}] {candidate['name']}")
         say(f"        {candidate['why']}")
+    if body.get("unresolved_exclusions"):
+        say(
+            "unresolved   "
+            + ", ".join(body["unresolved_exclusions"])
+            + " (no Qloo id; name match only, paraphrases can slip through)"
+        )
     if body["removed_by_exclusions"]:
         say("")
         say("filtered out by exclusions:")
@@ -196,6 +209,10 @@ def run_flow(http: Any) -> int:
 
     banner("Boundary")
     say(body["boundary"])
+    check = http.post(f"/sessions/{invite['session_id']}/preview", headers=headers)
+    if check.status_code != 404:
+        return _fail("session still stored after candidates", check)
+    say("session      removed after candidates; anecdotes are not kept on the server")
     return 0
 
 

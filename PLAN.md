@@ -18,8 +18,9 @@ WON'T: memory restoration; agitation reduction; disease treatment; music+photo s
 - Key from ~/.config/ax/secrets/qloo-hackathon.env (never commit)
 
 ## Qloo endpoints (docs-verified)
-- POST /v2/insights (primary; type-filtered recommendations from entity interests)
-- GET/POST /v2/tags (taxonomy)
+- GET /v2/insights (primary; type-filtered recommendations; query-string parameters, not a JSON POST)
+- POST /v2/tags (taxonomy search)
+- GET /search (entity lookup by name)
 
 ## Local routes
 - POST /invites
@@ -27,9 +28,12 @@ WON'T: memory restoration; agitation reduction; disease treatment; music+photo s
 - POST /sessions/{id}/exclusions
 - POST /sessions/{id}/preview
 - POST /sessions/{id}/candidates
+- DELETE /sessions/{id}
+
+Public demo retention: sessions expire after 24 hours, the store caps at 200, and a successful candidates call deletes the session.
 
 ## File list
-README.md, .env.example, requirements.txt, app/main.py, app/qloo.py, app/session.py, app/store.py, demo_cli.py, tests/test_exclusions.py, tests/test_no_invented_bio.py
+README.md, .env.example, requirements.txt, app/main.py, app/qloo.py, app/session.py, app/store.py, demo_cli.py, tests/test_exclusions.py, tests/test_no_invented_bio.py, tests/test_safety.py
 
 ## Milestone 1
 Scripted demo: create invite → upload one photo path + one anecdote → set one exclusion → caregiver preview → Qloo candidates that omit excluded entity and contain no photo-derived life story.
