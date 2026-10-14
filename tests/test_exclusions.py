@@ -114,7 +114,9 @@ def test_one_failing_insight_type_degrades_not_kills(client, fake_qloo):
     assert "music" in types and "film" in types
     assert "place" not in types
     assert [item["type"] for item in body["types_failed"]] == ["place"]
-    assert client.app.state.store.get(session_id) is None
+    stored = client.app.state.store.get(session_id)
+    assert stored is not None and stored["sealed"] is True
+    assert stored["uploads"][0]["anecdote"] == ""
 
 
 def test_invite_token_required_for_session_routes(client):
@@ -124,10 +126,17 @@ def test_invite_token_required_for_session_routes(client):
         "exclusions": {"exclusions": []},
         "preview": None,
         "candidates": None,
+        "guide": {"intent": "status"},
+        "spotify/start": None,
     }
     for path, body in valid_bodies.items():
         response = client.post(
             f"/sessions/{session_id}/{path}", json=body, headers={"X-Invite-Token": "wrong"}
+        )
+        assert response.status_code == 401, (path, response.status_code)
+    for path in ("export", "playlist.m3u"):
+        response = client.get(
+            f"/sessions/{session_id}/{path}", headers={"X-Invite-Token": "wrong"}
         )
         assert response.status_code == 401, (path, response.status_code)
     response = client.delete(

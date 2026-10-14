@@ -124,15 +124,22 @@ def test_delete_session_route(client):
     assert response.status_code == 404
 
 
-def test_candidates_delete_the_session(client):
+def test_candidates_seal_the_session_and_clear_family_text(client):
     session_id, headers = start_session(client)
     acknowledge(client, session_id, headers, [])
     run_to_preview(client, session_id, headers)
     body = run_to_candidates(client, session_id, headers)
     assert body["candidates"]
-    response = client.post(f"/sessions/{session_id}/candidates", headers=headers)
-    assert response.status_code == 404
-    assert client.app.state.store.get(session_id) is None
+    stored = client.app.state.store.get(session_id)
+    assert stored is not None
+    assert stored["sealed"] is True
+    assert stored["uploads"][0]["anecdote"] == ""
+    assert stored["uploads"][0]["photo_path"] == ""
+    replay = client.post(f"/sessions/{session_id}/candidates", headers=headers)
+    assert replay.status_code == 200
+    assert replay.json()["candidates"] == body["candidates"]
+    preview = client.post(f"/sessions/{session_id}/preview", headers=headers)
+    assert preview.status_code == 409
 
 
 def test_all_insight_types_failing_keeps_the_session(client, fake_qloo):

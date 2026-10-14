@@ -1,46 +1,74 @@
-"""FastAPI app for Guided Memory Lane v0.
+"""FastAPI app for Guided Memory Lane.
 
 Local routes (invite-first; every session route requires the one-time
 X-Invite-Token issued by POST /invites):
 
+    GET    /
+    GET    /sample-family
     POST   /invites
     POST   /sessions/{id}/uploads
     POST   /sessions/{id}/exclusions
     POST   /sessions/{id}/preview
+    POST   /sessions/{id}/guide
     POST   /sessions/{id}/candidates
+    GET    /sessions/{id}/export
+    GET    /sessions/{id}/playlist.m3u
+    POST   /sessions/{id}/spotify/start
+    GET    /spotify/callback
     DELETE /sessions/{id}
 
 Preview and candidates refuse to run until trauma exclusions have been
-acknowledged. Acknowledgment may look up Qloo tag/entity ids for the
-exclusion labels themselves. A successful candidates response deletes the
-session.
+acknowledged. A successful candidates response seals the session: anecdote
+text and the photo path are cleared, and the list stays for playlist export.
 """
 
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlencode
 
-from fastapi import FastAPI, Header, HTTPException, Response
-from fastapi.responses import JSONResponse
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from . import session as domain
+from .agent import (
+    assert_candidates,
+    interest_payload,
+    prepare_preview,
+    resolve_saved_exclusions,
+    status as guide_status,
+)
+from .playlist import (
+    OAUTH_MAX_AGE_SECONDS,
+    SpotifyAPI,
+    SpotifyError,
+    assemble_tracks,
+    authorize_url,
+    oauth_expired,
+    pkce_pair,
+    playlist_description,
+    playlist_name,
+    render_m3u,
+    uris_to_add,
+)
 from .qloo import INSIGHT_TYPES, QlooAuthError, QlooClient, QlooUpstreamError
+from .sample import SAMPLE
 from .store import JsonStore, StoreError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 APP_DESCRIPTION = (
     "Invite-first shared listening and looking sessions for families living "
     "with dementia. Photos are never analyzed, anecdotes never leave the "
     "family record, and Qloo cultural-affinity candidates are requested only "
     "after trauma exclusions and a caregiver preview."
-)
-
-_RESOLUTION_WARNING = (
-    "Exclusions are saved, but Qloo could not resolve them to tag or entity "
-    "ids. Those labels still filter by name, which can miss paraphrases."
 )
 
 _EXCLUSION_NOTE = (
@@ -50,6 +78,9 @@ _EXCLUSION_NOTE = (
     "by those ids. Unresolved labels are listed in unresolved_exclusions and "
     "still filter by name, which can miss paraphrases."
 )
+
+_COOKIE_SESSION = "gml_session"
+_COOKIE_INVITE = "gml_invite"
 
 
 def default_store_path() -> Path:
@@ -68,15 +99,21 @@ def _env_positive_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+class GuideRequest(BaseModel):
+    intent: Literal["status", "candidates"] = "status"
+
+
 def create_app(
     store_path: str | Path | None = None,
     qloo: Any | None = None,
     *,
     session_ttl_seconds: int | None = None,
     max_sessions: int | None = None,
+    spotify_client_id: str | None = None,
+    spotify_factory: Any | None = None,
 ) -> FastAPI:
-    """Build the app. Tests inject a store path and a Qloo double."""
-    app = FastAPI(title="Guided Memory Lane", version="0.1.0", description=APP_DESCRIPTION)
+    """Build the app. Tests inject a store path, a Qloo double, and Spotify."""
+    app = FastAPI(title="Guided Memory Lane", version="0.2.0", description=APP_DESCRIPTION)
     store = JsonStore(store_path or default_store_path())
     qloo_client: Any | None = qloo
     ttl = (
@@ -93,11 +130,31 @@ def create_app(
     app.state.session_ttl_seconds = ttl
     app.state.max_sessions = session_cap
 
+    def resolved_spotify_id() -> str | None:
+        if spotify_client_id is not None:
+            value = spotify_client_id
+        else:
+            value = os.environ.get("SPOTIFY_CLIENT_ID", "")
+        value = value.strip()
+        return value or None
+
+    def spotify_redirect(request: Request) -> str:
+        configured = os.environ.get("SPOTIFY_REDIRECT_URI", "").strip()
+        if configured:
+            return configured
+        return str(request.base_url).rstrip("/") + "/spotify/callback"
+
+    def make_spotify(redirect_uri: str) -> SpotifyAPI | None:
+        if spotify_factory is not None:
+            return spotify_factory(redirect_uri)
+        client_id = resolved_spotify_id()
+        if not client_id:
+            return None
+        return SpotifyAPI(client_id, redirect_uri)
+
     def get_qloo() -> Any:
         nonlocal qloo_client
         if qloo_client is None:
-            # Lazy so importing the app without a key still works; the two
-            # Qloo-touching routes surface a clean 503 instead.
             qloo_client = QlooClient()
         return qloo_client
 
@@ -121,25 +178,105 @@ def create_app(
             return HTTPException(status_code=502, detail=str(exc))
         return HTTPException(status_code=500, detail="unexpected Qloo client error")
 
-    def resolve_saved_exclusions(exclusions: list[dict[str, Any]]) -> str | None:
-        """Attach Qloo ids when the lookup works. Never blocks the save."""
-        if not exclusions:
-            return None
+    def require_music_export(session: dict[str, Any]) -> dict[str, Any]:
         try:
-            client_qloo = get_qloo()
-        except (QlooAuthError, QlooUpstreamError):
-            return _RESOLUTION_WARNING
-        failed = False
-        for exclusion in exclusions:
-            try:
-                exclusion["resolved_ids"] = domain.resolve_exclusion_ids(
-                    exclusion["label"], exclusion["kind"], client_qloo
-                )
-            except (QlooAuthError, QlooUpstreamError):
-                exclusion["resolved_ids"] = []
-                failed = True
-            exclusion["resolved"] = bool(exclusion["resolved_ids"])
-        return _RESOLUTION_WARNING if failed else None
+            domain.require_previewed(session)
+        except domain.SessionError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        export = session.get("export") or {}
+        payload = export.get("payload")
+        if not session.get("sealed") or not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="Build the candidate list before a playlist. The preview has to be signed first.",
+            )
+        return payload
+
+    def export_body(session: dict[str, Any]) -> dict[str, Any]:
+        payload = require_music_export(session)
+        exclusions = session.get("exclusions") or []
+        saved = session.get("playlist") or {}
+        if saved.get("tracks"):
+            tracks = saved["tracks"]
+            withheld = saved.get("withheld") or []
+        else:
+            tracks, withheld = assemble_tracks(payload.get("candidates") or [], exclusions, search=None)
+        label = session.get("caregiver_label") or ""
+        playlist = None
+        if saved.get("url"):
+            playlist = {
+                "id": saved.get("id"),
+                "url": saved.get("url"),
+                "public": False,
+                "name": saved.get("name") or playlist_name(label),
+            }
+        return {
+            "session_id": session["id"],
+            "caregiver_label": label,
+            "name": playlist_name(label),
+            "description": playlist_description(label),
+            "spotify_configured": resolved_spotify_id() is not None,
+            "playlist": playlist,
+            "tracks": tracks,
+            "withheld": withheld,
+            "candidates": payload.get("candidates") or [],
+            "removed_by_exclusions": payload.get("removed_by_exclusions") or [],
+            "boundary": payload.get("boundary"),
+            "guide": guide_status(session),
+        }
+
+    def set_oauth_cookies(response: Response, request: Request, session_id: str, token: str) -> None:
+        secure = request.url.scheme == "https"
+        common = {
+            "httponly": True,
+            "samesite": "lax",
+            "secure": secure,
+            "path": "/",
+            "max_age": OAUTH_MAX_AGE_SECONDS,
+        }
+        response.set_cookie(_COOKIE_SESSION, session_id, **common)
+        response.set_cookie(_COOKIE_INVITE, token, **common)
+
+    def playlist_redirect(flag: str, code: str | None = None) -> RedirectResponse:
+        query = {"playlist": flag}
+        if code:
+            query["code"] = code
+        response = RedirectResponse("/?" + urlencode(query), status_code=303)
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        response.delete_cookie(_COOKIE_SESSION, path="/")
+        response.delete_cookie(_COOKIE_INVITE, path="/")
+        return response
+
+    @app.middleware("http")
+    async def private_family_routes(request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if path.startswith("/sessions") or path.startswith("/invites") or path.startswith("/spotify"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/", include_in_schema=False)
+    def home() -> FileResponse:
+        return FileResponse(
+            STATIC_DIR / "index.html",
+            media_type="text/html",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @app.get("/sample-family")
+    def sample_family() -> dict[str, Any]:
+        return {
+            "caregiver_label": SAMPLE["caregiver_label"],
+            "photo_path": SAMPLE["photo_path"],
+            "anecdote": SAMPLE["anecdote"],
+            "interests": list(SAMPLE["interests"]),
+            "exclusions": list(SAMPLE["exclusions"]),
+            "note": (
+                "Sample family for the judge demo. The anecdote stays in the "
+                "family record and is not a Qloo signal."
+            ),
+        }
 
     @app.post("/invites", status_code=201)
     def create_invite(request: domain.InviteRequest) -> dict[str, Any]:
@@ -157,12 +294,14 @@ def create_app(
                     "or wait for unused sessions to expire."
                 ),
             )
-        return {
+        body = {
             "session_id": session["id"],
             "invite_token": token,
             "caregiver_label": session["caregiver_label"],
             "note": "This token is shown once. Keep it private; it authorizes this session.",
         }
+        body["guide"] = guide_status(session)
+        return body
 
     @app.post("/sessions/{session_id}/uploads", status_code=201)
     def add_upload(
@@ -173,6 +312,7 @@ def create_app(
         with store.session_scope(session_id):
             session = load_session(session_id, x_invite_token)
             try:
+                domain.require_open(session)
                 upload = domain.add_upload(session, request)
             except domain.SessionError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -184,6 +324,7 @@ def create_app(
                 "anecdote_chars": len(upload["anecdote"]),
                 "interests": upload["interests"],
                 "upload_count": len(session["uploads"]),
+                "guide": guide_status(session),
             }
 
     @app.post("/sessions/{session_id}/exclusions")
@@ -194,8 +335,12 @@ def create_app(
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
             session = load_session(session_id, x_invite_token)
+            try:
+                domain.require_open(session)
+            except domain.SessionError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
             exclusions = domain.acknowledge_exclusions(session, request)
-            warning = resolve_saved_exclusions(exclusions)
+            warning = resolve_saved_exclusions(exclusions, get_qloo)
             store.put(session)
             body: dict[str, Any] = {
                 "acknowledged": True,
@@ -203,6 +348,7 @@ def create_app(
                 "exclusions": exclusions,
                 "unresolved_exclusions": domain.unresolved_exclusion_labels(exclusions),
                 "note": _EXCLUSION_NOTE,
+                "guide": guide_status(session),
             }
             if warning:
                 body["resolution_warning"] = warning
@@ -216,11 +362,8 @@ def create_app(
         with store.session_scope(session_id):
             session = load_session(session_id, x_invite_token)
             try:
-                domain.require_uploads(session)
-                domain.require_exclusions_acknowledged(session)
-                interests = domain.collect_interests(session)
-                qloo = get_qloo()
-                signals, unresolved = domain.resolve_signals(interests, qloo)
+                domain.require_open(session)
+                signals, unresolved, trace = prepare_preview(session, get_qloo())
             except domain.SessionError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
             except (QlooAuthError, QlooUpstreamError) as exc:
@@ -228,11 +371,39 @@ def create_app(
             kept, withheld = domain.split_signals(signals, session["exclusions"] or [])
             session["resolved_signals"] = kept
             session["unresolved_interests"] = unresolved
+            session["agent_trace"] = trace
             session["previewed_at"] = domain.now_utc()
             store.put(session)
-            return domain.preview_payload(
+            body = domain.preview_payload(
                 session, kept_signals=kept, withheld=withheld, unresolved=unresolved
             )
+            body["guide"] = guide_status(session)
+            body["guide"]["tools"] = trace["tools"]
+            body["guide"]["input"] = trace["input"]
+            return body
+
+    @app.post("/sessions/{session_id}/guide")
+    def guide(
+        session_id: str,
+        request: GuideRequest,
+        x_invite_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        with store.session_scope(session_id):
+            session = load_session(session_id, x_invite_token)
+            view = guide_status(session)
+            if request.intent == "status":
+                return view
+            try:
+                assert_candidates(session)
+            except domain.SessionError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            if session.get("sealed"):
+                return {**view, "allowed": False, "input": interest_payload(session)}
+            return {
+                **view,
+                "allowed": True,
+                "input": interest_payload(session),
+            }
 
     @app.post("/sessions/{session_id}/candidates")
     def candidates(
@@ -241,8 +412,13 @@ def create_app(
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
             session = load_session(session_id, x_invite_token)
+            if session.get("sealed"):
+                payload = (session.get("export") or {}).get("payload")
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=409, detail="This session is sealed and has no stored list.")
+                return payload
             try:
-                domain.require_previewed(session)
+                assert_candidates(session)
             except domain.SessionError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
             signals = session["resolved_signals"] or []
@@ -277,9 +453,6 @@ def create_app(
                             take=6,
                         )
                     except QlooUpstreamError as exc:
-                        # One slow or failing category degrades, never kills, the
-                        # response (a place-type query was observed hanging >60s
-                        # live on 2026-10-13 while artist/film returned in ~2s).
                         types_failed.append({"type": label, "error": str(exc)[:200]})
                         continue
                     for entity in entities:
@@ -303,8 +476,174 @@ def create_app(
             for candidate in kept:
                 candidate["why"] = domain.candidate_reason(candidate["name"], kept_signals)
             payload = domain.candidates_payload(session, kept, removed, types_failed)
-            store.delete(session_id)
+            domain.seal_for_export(session, payload)
+            payload["guide"] = guide_status(session)
+            store.put(session)
             return payload
+
+    @app.get("/sessions/{session_id}/export")
+    def export_session(
+        session_id: str,
+        x_invite_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        with store.session_scope(session_id):
+            session = load_session(session_id, x_invite_token)
+            return export_body(session)
+
+    @app.get("/sessions/{session_id}/playlist.m3u")
+    def playlist_m3u(
+        session_id: str,
+        x_invite_token: str | None = Header(default=None),
+    ) -> Response:
+        with store.session_scope(session_id):
+            session = load_session(session_id, x_invite_token)
+            body = export_body(session)
+            m3u = render_m3u(body["name"], body["tracks"])
+        return Response(
+            content=m3u,
+            media_type="audio/x-mpegurl",
+            headers={
+                "Content-Disposition": 'attachment; filename="guided-memory-lane.m3u"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/sessions/{session_id}/spotify/start")
+    def spotify_start(
+        session_id: str,
+        request: Request,
+        x_invite_token: str | None = Header(default=None),
+    ) -> JSONResponse:
+        redirect_uri = spotify_redirect(request)
+        with store.session_scope(session_id):
+            session = load_session(session_id, x_invite_token)
+            require_music_export(session)
+            client_id = resolved_spotify_id()
+            api = make_spotify(redirect_uri)
+            if not client_id or api is None:
+                if api is not None:
+                    api.close()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            "Spotify is not configured on this server. Download the M3U "
+                            "or open the search links. Ask the operator for SPOTIFY_CLIENT_ID "
+                            "and the redirect URI in the Spotify dashboard."
+                        ),
+                        "fallback": "m3u",
+                    },
+                )
+            try:
+                verifier, challenge = pkce_pair()
+                state = secrets.token_urlsafe(24)
+                session["spotify_oauth"] = {
+                    "state": state,
+                    "verifier": verifier,
+                    "created_at": domain.now_utc(),
+                    "redirect_uri": redirect_uri,
+                }
+                store.put(session)
+                url = authorize_url(client_id, redirect_uri, state, challenge)
+            finally:
+                api.close()
+        response = JSONResponse({"authorize_url": url})
+        set_oauth_cookies(response, request, session_id, x_invite_token or "")
+        return response
+
+    @app.get("/spotify/callback", name="spotify_callback")
+    def spotify_callback(request: Request) -> RedirectResponse:
+        if request.query_params.get("error"):
+            return playlist_redirect("error", "denied")
+        code = (request.query_params.get("code") or "").strip()
+        state = (request.query_params.get("state") or "").strip()
+        session_id = request.cookies.get(_COOKIE_SESSION, "")
+        token = request.cookies.get(_COOKIE_INVITE, "")
+        if not session_id or not token:
+            return playlist_redirect("error", "cookie")
+        if not code or not state:
+            return playlist_redirect("error", "state")
+
+        # Verifier is single-use. Clear it before Spotify so a slow search
+        # does not hold the session stripe, and a second callback cannot reuse it.
+        job: dict[str, Any] | None = None
+        with store.session_scope(session_id):
+            try:
+                session = load_session(session_id, token)
+            except HTTPException as exc:
+                flag = "session" if exc.status_code == 404 else "invite"
+                return playlist_redirect("error", flag)
+            oauth = session.get("spotify_oauth") or {}
+            if not oauth or oauth.get("state") != state:
+                return playlist_redirect("error", "state")
+            if oauth_expired(str(oauth.get("created_at") or "")):
+                session["spotify_oauth"] = None
+                store.put(session)
+                return playlist_redirect("error", "stale")
+            try:
+                payload = require_music_export(session)
+            except HTTPException:
+                session["spotify_oauth"] = None
+                store.put(session)
+                return playlist_redirect("error", "state")
+            job = {
+                "verifier": str(oauth.get("verifier") or ""),
+                "redirect_uri": str(oauth.get("redirect_uri") or spotify_redirect(request)),
+                "candidates": list(payload.get("candidates") or []),
+                "exclusions": list(session.get("exclusions") or []),
+                "label": session.get("caregiver_label") or "",
+            }
+            session["spotify_oauth"] = None
+            store.put(session)
+
+        if job is None:
+            return playlist_redirect("error", "state")
+        api = make_spotify(job["redirect_uri"])
+        if api is None:
+            return playlist_redirect("error", "upstream")
+        try:
+            access_token = api.exchange_code(code, job["verifier"])
+
+            def search(artist: str) -> list[dict[str, Any]]:
+                return api.search_artist_tracks(access_token, artist)
+
+            tracks, withheld = assemble_tracks(
+                job["candidates"],
+                job["exclusions"],
+                search=search,
+            )
+            uris = uris_to_add(tracks, job["exclusions"])
+            if not uris:
+                if withheld and all(item.get("field") == "search" for item in withheld):
+                    return playlist_redirect("error", "upstream")
+                return playlist_redirect("error", "empty")
+            created = api.create_private_playlist(
+                access_token,
+                playlist_name(job["label"]),
+                playlist_description(job["label"]),
+            )
+            api.add_tracks(access_token, created["id"], uris)
+        except (SpotifyError, httpx.HTTPError):
+            return playlist_redirect("error", "upstream")
+        finally:
+            api.close()
+
+        with store.session_scope(session_id):
+            try:
+                session = load_session(session_id, token)
+            except HTTPException as exc:
+                flag = "session" if exc.status_code == 404 else "invite"
+                return playlist_redirect("error", flag)
+            session["playlist"] = {
+                "id": created["id"],
+                "url": created["url"],
+                "public": False,
+                "name": created["name"],
+                "tracks": tracks,
+                "withheld": withheld,
+            }
+            store.put(session)
+        return playlist_redirect("ready")
 
     @app.delete("/sessions/{session_id}", status_code=204)
     def delete_session(
@@ -319,6 +658,9 @@ def create_app(
     @app.exception_handler(StoreError)
     def store_error_handler(_: Any, exc: StoreError) -> JSONResponse:
         return JSONResponse(status_code=500, content={"detail": str(exc)})
+
+    if STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     return app
 

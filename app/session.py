@@ -1,7 +1,7 @@
 """Session domain and safety invariants for Guided Memory Lane.
 
 State machine:
-    invite -> uploads -> exclusions acknowledged -> preview -> candidates
+    invite -> uploads -> exclusions acknowledged -> preview -> candidates -> sealed export
 
 Invariants enforced here:
 1. No recommendation request happens before trauma exclusions are
@@ -203,6 +203,10 @@ def new_invite(caregiver_label: str) -> tuple[dict[str, Any], str]:
         "resolved_signals": None,
         "unresolved_interests": None,
         "previewed_at": None,
+        "sealed": False,
+        "export": None,
+        "spotify_oauth": None,
+        "playlist": None,
     }
     return session, token
 
@@ -271,6 +275,15 @@ def require_previewed(session: dict[str, Any]) -> None:
         raise SessionError(
             "Caregiver preview is required before candidates. "
             "POST /sessions/{id}/preview first."
+        )
+
+
+def require_open(session: dict[str, Any]) -> None:
+    """Block edits after the list is sealed and family text has been cleared."""
+    if session.get("sealed"):
+        raise SessionError(
+            "This session is sealed for playlist export. The anecdote and photo "
+            "path were cleared. Start a new invite to change the memory."
         )
 
 
@@ -692,6 +705,20 @@ def preview_payload(
             "background": COCHRANE_BACKGROUND,
         },
     }
+
+
+def seal_for_export(session: dict[str, Any], payload: dict[str, Any]) -> None:
+    """Keep exclusions and the list. Drop anecdote text and the photo path.
+
+    The playlist step still has to re-check exclusions, so the session stays.
+    Family prose does not.
+    """
+    session["sealed"] = True
+    session["export"] = {"payload": payload, "sealed_at": now_utc()}
+    session["spotify_oauth"] = None
+    for upload in session.get("uploads") or []:
+        upload["photo_path"] = ""
+        upload["anecdote"] = ""
 
 
 def candidates_payload(

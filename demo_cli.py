@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Guided Memory Lane v0 scripted demo.
+"""Guided Memory Lane scripted demo.
 
 Flow: invite -> upload (photo path + anecdote) -> trauma exclusion ->
-caregiver preview -> Qloo candidates.
+caregiver preview -> Qloo candidates -> playlist export.
 
 Modes:
     dry-run (default)  Exercises the real FastAPI app in-process against a
@@ -18,28 +18,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-DEMO: dict[str, Any] = {
-    "caregiver_label": "Asha (daughter)",
-    "photo_path": "/Users/pamu/Pictures/family/sunday-records-1974.jpg",
-    "anecdote": (
-        "Every Sunday after church, she played Nat King Cole records while "
-        "making lunch for the whole family."
-    ),
-    "interests": ["Nat King Cole", "jazz"],
-    "exclusions": [
-        {
-            "label": "war documentaries",
-            "kind": "topic",
-            "reason": "Family asked to avoid war themes.",
-        }
-    ],
-}
+from app.sample import SAMPLE as DEMO
 
 _secret_values: list[str] = []
 
@@ -123,7 +111,7 @@ def _fail(step: str, response: Any) -> int:
 
 
 def run_flow(http: Any) -> int:
-    banner("STEP 1 of 5: invite")
+    banner("STEP 1 of 6: invite")
     response = http.post("/invites", json={"caregiver_label": DEMO["caregiver_label"]})
     if response.status_code != 201:
         return _fail("invite", response)
@@ -133,7 +121,7 @@ def run_flow(http: Any) -> int:
     say(f"caregiver    {invite['caregiver_label']}")
     say("invite token issued once; the demo keeps it in memory only")
 
-    banner("STEP 2 of 5: upload (photo path + short anecdote)")
+    banner("STEP 2 of 6: upload (photo path + short anecdote)")
     response = http.post(
         f"/sessions/{invite['session_id']}/uploads",
         json={
@@ -151,7 +139,7 @@ def run_flow(http: Any) -> int:
     say(f"anecdote     {DEMO['anecdote']}")
     say(f"interests    {', '.join(DEMO['interests'])} (caregiver-typed, explicit)")
 
-    banner("STEP 3 of 5: trauma exclusions (before any Qloo call)")
+    banner("STEP 3 of 6: trauma exclusions (before any Qloo call)")
     response = http.post(
         f"/sessions/{invite['session_id']}/exclusions",
         json={"exclusions": DEMO["exclusions"]},
@@ -169,7 +157,7 @@ def run_flow(http: Any) -> int:
             + " (no Qloo id; name match only, paraphrases can slip through)"
         )
 
-    banner("STEP 4 of 5: caregiver preview (first Qloo touch)")
+    banner("STEP 4 of 6: caregiver preview (first Qloo touch)")
     response = http.post(f"/sessions/{invite['session_id']}/preview", headers=headers)
     if response.status_code != 200:
         return _fail("preview", response)
@@ -182,7 +170,7 @@ def run_flow(http: Any) -> int:
     say(f"             types: {', '.join(preview['what_qloo_receives']['insight_types'])}")
     say(f"note         {preview['what_qloo_receives']['note']}")
 
-    banner("STEP 5 of 5: Qloo candidates (after exclusions)")
+    banner("STEP 5 of 6: Qloo candidates (after exclusions)")
     response = http.post(f"/sessions/{invite['session_id']}/candidates", headers=headers)
     if response.status_code != 200:
         return _fail("candidates", response)
@@ -207,12 +195,37 @@ def run_flow(http: Any) -> int:
         for item in body["types_failed"]:
             say(f"        {item['type']}: {item['error']}")
 
+    banner("STEP 6 of 6: playlist export")
+    response = http.get(f"/sessions/{invite['session_id']}/export", headers=headers)
+    if response.status_code != 200:
+        return _fail("export", response)
+    plan = response.json()
+    say(f"name         {plan['name']}")
+    say(f"description  {plan['description']}")
+    if plan["spotify_configured"]:
+        say("spotify      client id is set; the browser completes the private playlist")
+    else:
+        say("spotify      no client id; M3U and search links are the playlist")
+    for track in plan["tracks"]:
+        say(f"track        {track['artist']}  {track['search_url']}")
+    response = http.get(f"/sessions/{invite['session_id']}/playlist.m3u", headers=headers)
+    if response.status_code != 200:
+        return _fail("m3u", response)
+    m3u = response.text
+    if "Documentary" in m3u or "church" in m3u.lower() or "lunch" in m3u.lower():
+        say("FAILED: playlist export leaked an exclusion or the anecdote")
+        say(m3u[:600])
+        return 1
+    if "Nat%20King%20Cole" not in m3u and "Nat King Cole" not in m3u:
+        say("FAILED: sample artist missing from the M3U")
+        return 1
+
     banner("Boundary")
     say(body["boundary"])
     check = http.post(f"/sessions/{invite['session_id']}/preview", headers=headers)
-    if check.status_code != 404:
-        return _fail("session still stored after candidates", check)
-    say("session      removed after candidates; anecdotes are not kept on the server")
+    if check.status_code != 409:
+        return _fail("session was not sealed after candidates", check)
+    say("session      sealed for export; anecdote and photo path cleared on the server")
     return 0
 
 
@@ -240,7 +253,11 @@ def main() -> int:
         say("mode: dry-run (in-process app, canned Qloo double, no network, no key)")
         with tempfile.TemporaryDirectory(prefix="gml-demo-") as tmp:
             client = TestClient(
-                create_app(store_path=Path(tmp) / "demo-store.json", qloo=DemoQloo())
+                create_app(
+                    store_path=Path(tmp) / "demo-store.json",
+                    qloo=DemoQloo(),
+                    spotify_client_id="",
+                )
             )
             return run_flow(client)
 

@@ -1,0 +1,406 @@
+/* Caregiver desk. ENERGY 2 / RHYTHM 2 / MOTION 1.
+   Paper #f6f1e7 and ink #241c16: a daylight room, type like a printed sleeve.
+   Accent #8c2f24: record-label red, used on the primary action and the sleeve rule.
+   Fraunces: liner-note title. Source Sans 3: the form, at a size that stays readable.
+   Double rule: sleeve spine, on the mast and the preview sheet only.
+   Shadow: the preview sheet only, because that is the page being signed.
+   Radius: 2px fields, 4px primary button. Fixed light theme: living-room paper. */
+
+:root {
+  --paper: #f6f1e7;
+  --sheet: #fffaf3;
+  --ink: #241c16;
+  --accent: #8c2f24;
+  --accent-ink: #fffaf3;
+  --line: #5c4e43;
+  --rule: #d9cbb6;
+  --space: 1rem;
+  --serif: "Fraunces", "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+  --sans: "Source Sans 3", "Segoe UI", sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 1.0625rem;
+  line-height: 1.5;
+}
+
+.page {
+  width: min(100% - 2rem, 68rem);
+  margin: 0 auto;
+  padding: 1.25rem 0 calc(2.5rem + env(safe-area-inset-bottom));
+}
+
+.skip {
+  position: absolute;
+  left: 1rem;
+  top: -4rem;
+  background: var(--sheet);
+  color: var(--ink);
+  padding: 0.6rem 0.8rem;
+}
+
+.skip:focus {
+  top: 1rem;
+  z-index: 2;
+}
+
+.mast {
+  max-width: 38rem;
+  margin-bottom: 1.75rem;
+}
+
+.wordmark {
+  margin: 0 0 0.75rem;
+  font-family: var(--serif);
+  font-size: 1rem;
+  font-weight: 560;
+}
+
+.wordmark::after {
+  content: "";
+  display: block;
+  width: 4.5rem;
+  margin-top: 0.45rem;
+  border-top: 3px solid var(--accent);
+  border-bottom: 1px solid var(--accent);
+  height: 4px;
+}
+
+h1 {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: 560;
+  font-size: clamp(1.8rem, 1.2rem + 2.2vw, 2.7rem);
+  line-height: 1.12;
+  letter-spacing: -0.02em;
+  max-width: 16em;
+}
+
+.lede {
+  margin: 0.9rem 0 0;
+  max-width: 38rem;
+  font-size: 1.125rem;
+}
+
+.layout {
+  display: grid;
+  gap: 1.25rem;
+}
+
+.rail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.rail button {
+  min-height: 44px;
+  padding: 0.4rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.rail button[aria-current="step"] {
+  background: var(--ink);
+  color: var(--sheet);
+  border-color: var(--ink);
+}
+
+.rail button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+main h2 {
+  margin: 0 0 0.35rem;
+  font-family: var(--serif);
+  font-weight: 560;
+  font-size: clamp(1.45rem, 1.2rem + 1vw, 1.9rem);
+  line-height: 1.2;
+}
+
+h2:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 4px;
+}
+
+.guide,
+.hint,
+.result {
+  color: var(--ink);
+}
+
+.guide,
+.hint {
+  margin: 0 0 1rem;
+  max-width: 40rem;
+}
+
+.hint {
+  margin-top: -0.35rem;
+  font-size: 0.95rem;
+}
+
+form,
+.sheet,
+#list-body,
+#playlist-body,
+#exclusion-result,
+#invite-result {
+  max-width: 40rem;
+}
+
+label {
+  display: block;
+  margin: 0.9rem 0 0.35rem;
+  font-weight: 600;
+}
+
+input,
+textarea,
+select {
+  width: 100%;
+  min-height: 44px;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--sheet);
+  color: var(--ink);
+  font: inherit;
+}
+
+textarea {
+  min-height: 7rem;
+  resize: vertical;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+button.primary,
+button.secondary,
+a.button {
+  min-height: 44px;
+  padding: 0.55rem 0.95rem;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+button.primary,
+a.button {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: 1px solid #6e241c;
+  border-radius: 4px;
+}
+
+button.secondary {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--ink);
+  border-radius: 2px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.status {
+  min-height: 1.5rem;
+  margin: 0 0 0.5rem;
+  font-weight: 600;
+}
+
+.error {
+  margin: 0 0 1rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid #6e241c;
+  background: #f8ece8;
+  max-width: 40rem;
+}
+
+.error[hidden],
+[hidden] {
+  display: none !important;
+}
+
+.token {
+  margin: 0.5rem 0 0;
+  padding: 0.7rem 0.8rem;
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  overflow-wrap: anywhere;
+  font-family: var(--sans);
+}
+
+.sheet {
+  margin-top: 1.25rem;
+  padding: 1.1rem 1rem 1.25rem;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  box-shadow: 0 18px 36px rgba(36, 28, 22, 0.08);
+}
+
+.sheet .sleeve {
+  height: 4px;
+  margin: 0 0 1rem;
+  border-top: 3px solid var(--accent);
+  border-bottom: 1px solid var(--accent);
+}
+
+.boundary {
+  display: grid;
+  gap: 1.25rem;
+}
+
+.sheet h3 {
+  margin: 0 0 0.4rem;
+  font-family: var(--serif);
+  font-size: 1.25rem;
+  font-weight: 560;
+}
+
+.sheet ul,
+.sheet ol,
+.names {
+  margin: 0;
+  padding-left: 1.15rem;
+}
+
+.music-name {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 1.45rem;
+  font-weight: 560;
+  line-height: 1.2;
+}
+
+.quiet-list {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0;
+}
+
+.quiet-list li,
+.track-row {
+  padding: 0.55rem 0;
+  border-top: 1px solid var(--rule);
+}
+
+.track-row a {
+  color: var(--ink);
+}
+
+.why,
+.meta {
+  margin: 0.15rem 0 0;
+}
+
+.background {
+  margin: 1rem 0 0;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--rule);
+}
+
+.colophon {
+  margin-top: 2.5rem;
+  max-width: 38rem;
+  font-size: 0.95rem;
+}
+
+.exclusion-row {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.75rem;
+}
+
+img.thumb {
+  width: 4rem;
+  height: 4rem;
+  object-fit: cover;
+  background: var(--rule);
+  display: block;
+}
+
+@media (min-width: 40rem) {
+  .page {
+    padding-top: 2rem;
+  }
+
+  .boundary {
+    grid-template-columns: 1.15fr 0.85fr;
+    gap: 1.75rem;
+    align-items: start;
+  }
+
+  .exclusion-row {
+    grid-template-columns: 1.4fr 0.8fr;
+  }
+
+  .exclusion-row .reason,
+  .exclusion-row .remove {
+    grid-column: 1 / -1;
+  }
+
+  .exclusion-row .remove {
+    justify-self: start;
+  }
+}
+
+@media (min-width: 64rem) {
+  .layout {
+    grid-template-columns: 11.5rem minmax(0, 1fr);
+    gap: 2.5rem;
+    align-items: start;
+  }
+
+  .rail {
+    flex-direction: column;
+    position: sticky;
+    top: 1rem;
+  }
+
+  .rail button {
+    width: 100%;
+    justify-content: flex-start;
+    text-align: left;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
