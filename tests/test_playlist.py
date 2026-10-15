@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.playlist import SpotifyAPI, assemble_tracks, choose_track, pkce_pair
 from app.sample import SAMPLE
-from conftest import acknowledge, run_to_candidates, run_to_preview, start_session
+from conftest import acknowledge, open_account, run_to_candidates, run_to_preview, start_session
 
 
 def _reach_export(client, headers, session_id, exclusions):
@@ -125,10 +125,15 @@ def test_m3u_keeps_music_and_drops_excluded_film(client):
 
     start = client.post(f"/sessions/{session_id}/spotify/start", headers=headers)
     assert start.status_code == 409
-    assert start.json()["detail"]["fallback"] == "m3u"
+    detail = start.json()["detail"]
+    assert detail["fallback"] == "m3u"
+    apology = str(detail).lower()
+    assert "client id" not in apology
+    assert "spotify_client_id" not in apology
 
 
 def test_sample_family_playlist_omits_the_anecdote(client):
+    open_account(client)
     invite = client.post("/invites", json={"caregiver_label": SAMPLE["caregiver_label"]})
     assert invite.status_code == 201, invite.text
     session_id = invite.json()["session_id"]

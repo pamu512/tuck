@@ -111,7 +111,11 @@ def _fail(step: str, response: Any) -> int:
 
 
 def run_flow(http: Any) -> int:
-    banner("STEP 1 of 6: invite")
+    banner("STEP 1 of 6: account, then invite")
+    email = f"demo-{os.urandom(3).hex()}@example.com"
+    response = http.post("/accounts", json={"email": email, "password": "tuck-demo-pass"})
+    if response.status_code != 201:
+        return _fail("account", response)
     response = http.post("/invites", json={"caregiver_label": DEMO["caregiver_label"]})
     if response.status_code != 201:
         return _fail("invite", response)
@@ -203,9 +207,9 @@ def run_flow(http: Any) -> int:
     say(f"name         {plan['name']}")
     say(f"description  {plan['description']}")
     if plan["spotify_configured"]:
-        say("spotify      client id is set; the browser completes the private playlist")
+        say("spotify      connected; the browser completes the private playlist")
     else:
-        say("spotify      no client id; M3U and search links are the playlist")
+        say("spotify      not connected; the listening file and search links are the playlist")
     for track in plan["tracks"]:
         say(f"track        {track['artist']}  {track['search_url']}")
     response = http.get(f"/sessions/{invite['session_id']}/playlist.m3u", headers=headers)
@@ -257,6 +261,7 @@ def main() -> int:
                     store_path=Path(tmp) / "demo-store.json",
                     qloo=DemoQloo(),
                     spotify_client_id="",
+                    session_secret="demo-dry-run-secret",
                 )
             )
             return run_flow(client)

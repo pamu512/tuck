@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.session import UploadRequest
 from app.store import JsonStore
-from conftest import acknowledge, run_to_candidates, run_to_preview, start_session
+from conftest import acknowledge, open_account, run_to_candidates, run_to_preview, start_session
 
 
 def test_interest_shorter_than_three_characters_is_rejected(client):
@@ -194,6 +194,7 @@ def test_session_cap_returns_429_and_expired_rows_do_not_count(tmp_path, fake_ql
             max_sessions=1,
         )
     )
+    open_account(client)
     first = client.post("/invites", json={"caregiver_label": "A"})
     assert first.status_code == 201, first.text
     second = client.post("/invites", json={"caregiver_label": "B"})

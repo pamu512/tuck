@@ -1,0 +1,243 @@
+"""Adaptive probes. Each answer is stored as typed. Nothing is inferred from it.
+
+Full path asks 12. Exit opens once 8 answers are in, and it still asks what
+should stay out before a preview can be built.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+NONE_WORDS = frozenset({"none", "nothing", "no", "n/a", "na", "skip", "nothing else"})
+MIN_ANSWERS_BEFORE_EXIT = 8
+MAX_PHRASE = 80
+
+PROBES: tuple[dict[str, Any], ...] = (
+    {
+        "id": "hands",
+        "topic": "hobbies",
+        "writes": "interest",
+        "optional": False,
+        "skip_on_exit": False,
+        "ask": "What do they still like to do, or what did they like doing with their hands?",
+    },
+    {
+        "id": "place",
+        "topic": "hobbies",
+        "writes": "interest",
+        "optional": True,
+        "skip_on_exit": True,
+        "ask": "Is there a place that belongs with that? A kitchen, a garden, a town.",
+    },
+    {
+        "id": "moment",
+        "topic": "memory",
+        "writes": "anecdote",
+        "optional": False,
+        "skip_on_exit": False,
+        "ask": "Tell me one ordinary moment you want in the room.",
+    },
+    {
+        "id": "music",
+        "topic": "music",
+        "writes": "interest",
+        "optional": False,
+        "skip_on_exit": False,
+        "ask": "Name a singer, a song, or a kind of music they would put on.",
+    },
+    {
+        "id": "music_more",
+        "topic": "music",
+        "writes": "interest",
+        "optional": True,
+        "skip_on_exit": True,
+        "follow": "music",
+        "ask": "Is there another singer or song, or is that the one?",
+    },
+    {
+        "id": "film",
+        "topic": "movies",
+        "writes": "interest",
+        "optional": False,
+        "skip_on_exit": False,
+        "ask": "A film, or a kind of film, they would sit through?",
+    },
+    {
+        "id": "film_more",
+        "topic": "movies",
+        "writes": "interest",
+        "optional": True,
+        "skip_on_exit": True,
+        "follow": "film",
+        "ask": "Another film, or is that enough?",
+    },
+    {
+        "id": "when",
+        "topic": "habits",
+        "writes": "habit",
+        "optional": False,
+        "skip_on_exit": True,
+        "ask": "What time of day is easiest to sit and listen?",
+    },
+    {
+        "id": "span",
+        "topic": "habits",
+        "writes": "habit",
+        "optional": False,
+        "skip_on_exit": True,
+        "ask": "How long is comfortable? A few songs, or closer to an hour?",
+    },
+    {
+        "id": "company",
+        "topic": "habits",
+        "writes": "habit",
+        "optional": True,
+        "skip_on_exit": True,
+        "ask": "Who else is usually in the room with you?",
+    },
+    {
+        "id": "leave_out",
+        "topic": "exclusions",
+        "writes": "exclusion",
+        "optional": False,
+        "skip_on_exit": False,
+        "ask": "What should stay out? A topic, a performer, a kind of film. Say none if nothing should.",
+    },
+    {
+        "id": "leave_more",
+        "topic": "exclusions",
+        "writes": "exclusion",
+        "optional": True,
+        "skip_on_exit": True,
+        "ask": "Anything else that should stay out?",
+    },
+)
+
+FEEDBACK: tuple[dict[str, str], ...] = (
+    {"id": "fit", "ask": "Did this list feel like them?"},
+    {"id": "next", "ask": "What should I ask differently next time?"},
+)
+
+PROBES_BY_ID = {probe["id"]: probe for probe in PROBES}
+NO_PHOTO = "not-provided"
+
+
+def fresh_interview() -> dict[str, Any]:
+    return {"answers": {}, "exited": False, "committed": False}
+
+
+def _rich(text: str) -> bool:
+    folded = text.casefold()
+    return len(text) >= 40 or "," in text or " and " in folded
+
+
+def _skipped(probe: dict[str, Any], answers: dict[str, str], exited: bool) -> bool:
+    if probe["id"] in answers:
+        return False
+    follow = probe.get("follow")
+    if follow and _rich(answers.get(follow, "")):
+        return True
+    if probe["id"] == "leave_more":
+        prior = answers.get("leave_out", "").strip().casefold()
+        if prior in NONE_WORDS:
+            return True
+    if exited and probe.get("skip_on_exit"):
+        return True
+    return False
+
+
+def next_probe(answers: dict[str, str], exited: bool) -> dict[str, Any] | None:
+    for probe in PROBES:
+        if probe["id"] in answers:
+            continue
+        if _skipped(probe, answers, exited):
+            continue
+        return probe
+    return None
+
+
+def can_exit(answers: dict[str, str], exited: bool) -> bool:
+    if exited or len(answers) < MIN_ANSWERS_BEFORE_EXIT:
+        return False
+    if "moment" not in answers:
+        return False
+    return any(PROBES_BY_ID[key]["writes"] == "interest" for key in answers if key in PROBES_BY_ID)
+
+
+def _phrases(text: str) -> list[str]:
+    parts = [part.strip() for part in text.replace(";", ",").split(",")]
+    kept: list[str] = []
+    for part in parts:
+        if not part or part.casefold() in NONE_WORDS:
+            continue
+        kept.append(part)
+    return kept
+
+
+def validate_answer(probe: dict[str, Any], text: str) -> str:
+    text = " ".join(text.split())
+    if not text:
+        raise ValueError("Say it in a few words, or say none.")
+    kind = probe["writes"]
+    if kind == "anecdote":
+        if len(text) > 600:
+            raise ValueError("Keep the moment under 600 characters.")
+        if text.casefold() in NONE_WORDS:
+            raise ValueError("I need one moment in your words, even a small one.")
+        return text
+    if kind == "habit":
+        if len(text) > 200:
+            raise ValueError("Keep that to a short note.")
+        return text
+    if text.casefold() in NONE_WORDS:
+        if kind == "exclusion" or probe.get("optional"):
+            return text
+        raise ValueError("Name something they like, in a few words.")
+    for part in _phrases(text):
+        if len(part) < 3:
+            raise ValueError("Use at least a few letters for each name.")
+        if len(part) > MAX_PHRASE:
+            raise ValueError("Keep each name under 80 characters. Commas split more than one.")
+    if not _phrases(text):
+        raise ValueError("Name something they like, in a few words.")
+    return text
+
+
+def materialize(answers: dict[str, str]) -> dict[str, Any]:
+    """Turn stored answers into upload fields. Skipped and 'none' add nothing."""
+    interests: list[str] = []
+    exclusions: list[str] = []
+    habits: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for probe in PROBES:
+        text = answers.get(probe["id"])
+        if not text:
+            continue
+        kind = probe["writes"]
+        if kind == "interest":
+            for phrase in _phrases(text):
+                key = phrase.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                interests.append(phrase)
+        elif kind == "habit" and text.casefold() not in NONE_WORDS:
+            habits.append({"id": probe["id"], "text": text})
+        elif kind == "exclusion":
+            exclusions.extend(_phrases(text))
+    anecdote = (answers.get("moment") or "").strip()
+    return {
+        "interests": interests[:8],
+        "exclusions": exclusions[:12],
+        "habits": habits,
+        "anecdote": anecdote,
+        "photo_path": NO_PHOTO,
+    }
+
+
+def pending_feedback(saved: dict[str, Any] | None) -> dict[str, str] | None:
+    data = saved or {}
+    for item in FEEDBACK:
+        if not str(data.get(item["id"]) or "").strip():
+            return item
+    return None

@@ -1,11 +1,21 @@
-"""FastAPI app for Guided Memory Lane.
+"""FastAPI app for Tuck (Guided Memory Lane).
 
-Local routes (invite-first; every session route requires the one-time
-X-Invite-Token issued by POST /invites):
+An account cookie is required before a session. Session routes still require
+the one-time X-Invite-Token from POST /invites. POST /dev/sample is the only
+unauthenticated session, and it only loads the canned sample family.
 
     GET    /
+    POST   /accounts
+    POST   /login
+    POST   /logout
+    GET    /me
+    POST   /me/profile
     GET    /sample-family
+    POST   /dev/sample
     POST   /invites
+    GET    /sessions/{id}/interview
+    POST   /sessions/{id}/interview
+    POST   /sessions/{id}/feedback
     POST   /sessions/{id}/uploads
     POST   /sessions/{id}/exclusions
     POST   /sessions/{id}/preview
@@ -17,9 +27,8 @@ X-Invite-Token issued by POST /invites):
     GET    /spotify/callback
     DELETE /sessions/{id}
 
-Preview and candidates refuse to run until trauma exclusions have been
-acknowledged. A successful candidates response seals the session: anecdote
-text and the photo path are cleared, and the list stays for playlist export.
+Preview and candidates refuse to run until exclusions have been acknowledged.
+A successful candidates response seals the session.
 """
 
 from __future__ import annotations
@@ -34,9 +43,30 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import session as domain
+from .accounts import (
+    ACCOUNT_COOKIE,
+    LoginRequest,
+    ProfileNameRequest,
+    RegisterRequest,
+    clear_failures,
+    dummy_password,
+    issue_cookie,
+    locked_for,
+    new_account,
+    note_failure,
+    public_account,
+    read_cookie,
+    read_secret_file,
+    resolve_session_secret,
+    verify_password,
+    write_commit,
+    write_feedback,
+    write_person_name,
+    write_probe,
+)
 from .agent import (
     assert_candidates,
     interest_payload,
@@ -56,6 +86,15 @@ from .playlist import (
     playlist_name,
     render_m3u,
     uris_to_add,
+)
+from .interview import (
+    NO_PHOTO,
+    can_exit,
+    fresh_interview,
+    materialize,
+    next_probe,
+    pending_feedback,
+    validate_answer,
 )
 from .qloo import INSIGHT_TYPES, QlooAuthError, QlooClient, QlooUpstreamError
 from .sample import SAMPLE
@@ -103,6 +142,16 @@ class GuideRequest(BaseModel):
     intent: Literal["status", "candidates"] = "status"
 
 
+class InterviewTurn(BaseModel):
+    text: str | None = None
+    exit: bool = False
+
+
+class FeedbackTurn(BaseModel):
+    id: Literal["fit", "next"]
+    text: str = Field(min_length=1, max_length=400)
+
+
 def create_app(
     store_path: str | Path | None = None,
     qloo: Any | None = None,
@@ -111,10 +160,14 @@ def create_app(
     max_sessions: int | None = None,
     spotify_client_id: str | None = None,
     spotify_factory: Any | None = None,
+    session_secret: str | None = None,
 ) -> FastAPI:
     """Build the app. Tests inject a store path, a Qloo double, and Spotify."""
-    app = FastAPI(title="Guided Memory Lane", version="0.2.0", description=APP_DESCRIPTION)
+    app = FastAPI(title="Tuck", version="0.3.0", description=APP_DESCRIPTION)
     store = JsonStore(store_path or default_store_path())
+    accounts = JsonStore(store.path.with_name("accounts.json"))
+    app.state.session_secret = resolve_session_secret(session_secret)
+    app.state.accounts = accounts
     qloo_client: Any | None = qloo
     ttl = (
         session_ttl_seconds
@@ -134,12 +187,16 @@ def create_app(
         if spotify_client_id is not None:
             value = spotify_client_id
         else:
-            value = os.environ.get("SPOTIFY_CLIENT_ID", "")
+            value = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+            if not value:
+                value = read_secret_file("SPOTIFY_CLIENT_ID")
         value = value.strip()
         return value or None
 
     def spotify_redirect(request: Request) -> str:
         configured = os.environ.get("SPOTIFY_REDIRECT_URI", "").strip()
+        if not configured:
+            configured = read_secret_file("SPOTIFY_REDIRECT_URI")
         if configured:
             return configured
         return str(request.base_url).rstrip("/") + "/spotify/callback"
@@ -171,6 +228,123 @@ def create_app(
             )
         return session
 
+    def require_account(request: Request) -> dict[str, Any]:
+        if not app.state.session_secret:
+            raise HTTPException(status_code=503, detail="Sign-in is not configured on this server.")
+        account_id = read_cookie(request.cookies.get(ACCOUNT_COOKIE), app.state.session_secret)
+        if not account_id:
+            raise HTTPException(status_code=401, detail="Sign in before opening a session.")
+        account = accounts.get(account_id)
+        if account is None or "password" not in account:
+            raise HTTPException(status_code=401, detail="Sign in before opening a session.")
+        return account
+
+    def set_account_cookie(response: Response, request: Request, account_id: str) -> None:
+        response.set_cookie(
+            ACCOUNT_COOKIE,
+            issue_cookie(account_id, app.state.session_secret),
+            httponly=True,
+            samesite="lax",
+            secure=request.url.scheme == "https",
+            path="/",
+            max_age=14 * 24 * 60 * 60,
+        )
+
+    def find_account_by_email(email: str) -> dict[str, Any] | None:
+        # ponytail: scans the account file. Ceiling: hundreds of accounts.
+        # Upgrade path: an email index beside the file.
+        for account in accounts.read_all().values():
+            if isinstance(account, dict) and account.get("email") == email:
+                return account
+        return None
+
+    def save_account(account: dict[str, Any]) -> None:
+        with accounts.session_scope(account["id"]):
+            accounts.put(account)
+
+    def attach_account(session: dict[str, Any], account: dict[str, Any] | None) -> None:
+        session["account_id"] = account["id"] if account else None
+        session["interview"] = fresh_interview()
+        session["feedback"] = {}
+
+    def interview_view(session: dict[str, Any]) -> dict[str, Any]:
+        interview = session.get("interview") or fresh_interview()
+        answers = dict(interview.get("answers") or {})
+        exited = bool(interview.get("exited"))
+        committed = bool(interview.get("committed"))
+        probe = None if committed else next_probe(answers, exited)
+        pending = pending_feedback(session.get("feedback")) if session.get("sealed") else None
+        if session.get("sealed"):
+            phase = "gift"
+            asked = f"Listening for {session.get('caregiver_label') or 'them'}."
+        elif session.get("previewed_at"):
+            phase = "list"
+            asked = "The preview is signed. Ask for the list when you are ready."
+        elif committed:
+            phase = "preview"
+            asked = "I can build the preview from what you told me. Nothing is requested until you say so."
+        elif probe:
+            phase = "probe"
+            asked = probe["ask"]
+        else:
+            phase = "preview"
+            asked = "I can build the preview from what you told me. Nothing is requested until you say so."
+        return {
+            "phase": phase,
+            "asked": asked,
+            "probe": (
+                {"id": probe["id"], "topic": probe["topic"], "ask": probe["ask"]} if probe else None
+            ),
+            "can_exit": bool(probe) and can_exit(answers, exited) and not committed,
+            "committed": committed,
+            "answer_count": len(answers),
+            "caregiver_label": session.get("caregiver_label") or "",
+            "feedback_id": pending["id"] if pending else None,
+            "feedback_ask": pending["ask"] if pending else None,
+        }
+
+    def commit_interview(session: dict[str, Any]) -> None:
+        interview = session.setdefault("interview", fresh_interview())
+        if interview.get("committed"):
+            return
+        built = materialize(dict(interview.get("answers") or {}))
+        if not built["anecdote"]:
+            raise HTTPException(status_code=409, detail="I still need one moment in your words.")
+        if not built["interests"]:
+            raise HTTPException(
+                status_code=409,
+                detail="I still need a singer, a film, or something they like, in a few words.",
+            )
+        if "leave_out" not in (interview.get("answers") or {}):
+            raise HTTPException(status_code=409, detail="Tell me what should stay out before the preview.")
+        try:
+            domain.require_open(session)
+            domain.add_upload(
+                session,
+                domain.UploadRequest(
+                    photo_path=NO_PHOTO,
+                    anecdote=built["anecdote"],
+                    interests=built["interests"],
+                ),
+            )
+            exclusions = domain.acknowledge_exclusions(
+                session,
+                domain.ExclusionsRequest(
+                    exclusions=[{"label": label, "kind": "topic"} for label in built["exclusions"]]
+                ),
+            )
+        except domain.SessionError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        warning = resolve_saved_exclusions(exclusions, get_qloo)
+        interview["committed"] = True
+        interview["resolution_warning"] = warning
+        account_id = session.get("account_id")
+        if account_id:
+            account = accounts.get(account_id)
+            if account:
+                write_commit(account, habits=built["habits"], exclusions=list(built["exclusions"]))
+                save_account(account)
+
     def guarded_qloo_errors(exc: Exception) -> HTTPException:
         if isinstance(exc, QlooAuthError):
             return HTTPException(status_code=503, detail=str(exc))
@@ -197,10 +371,20 @@ def create_app(
         exclusions = session.get("exclusions") or []
         saved = session.get("playlist") or {}
         if saved.get("tracks"):
-            tracks = saved["tracks"]
+            tracks = [dict(track) for track in saved["tracks"]]
             withheld = saved.get("withheld") or []
         else:
             tracks, withheld = assemble_tracks(payload.get("candidates") or [], exclusions, search=None)
+            tracks = [dict(track) for track in tracks]
+        why_by_name = {
+            str(candidate.get("name") or "").casefold(): candidate.get("why")
+            for candidate in payload.get("candidates") or []
+            if candidate.get("name") and candidate.get("why")
+        }
+        for track in tracks:
+            artist = str(track.get("artist") or "").casefold()
+            if artist in why_by_name and not track.get("why"):
+                track["why"] = why_by_name[artist]
         label = session.get("caregiver_label") or ""
         playlist = None
         if saved.get("url"):
@@ -252,7 +436,16 @@ def create_app(
     async def private_family_routes(request: Request, call_next):
         response = await call_next(request)
         path = request.url.path
-        if path.startswith("/sessions") or path.startswith("/invites") or path.startswith("/spotify"):
+        private = (
+            path.startswith("/sessions")
+            or path.startswith("/invites")
+            or path.startswith("/spotify")
+            or path.startswith("/accounts")
+            or path.startswith("/login")
+            or path.startswith("/me")
+            or path.startswith("/dev")
+        )
+        if private:
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -278,9 +471,111 @@ def create_app(
             ),
         }
 
+    @app.post("/accounts", status_code=201)
+    def register(body: RegisterRequest, request: Request) -> JSONResponse:
+        if not app.state.session_secret:
+            raise HTTPException(status_code=503, detail="Sign-in is not configured on this server.")
+        if locked_for(body.email):
+            raise HTTPException(status_code=429, detail="Too many tries. Wait a little, then try again.")
+        with accounts.session_scope(body.email):
+            if find_account_by_email(body.email):
+                raise HTTPException(
+                    status_code=409,
+                    detail="That email already has an account. Say you already have one.",
+                )
+            account = new_account(body.email, body.password)
+            accounts.put(account)
+        clear_failures(body.email)
+        response = JSONResponse(public_account(account), status_code=201)
+        set_account_cookie(response, request, account["id"])
+        return response
+
+    @app.post("/login")
+    def login(body: LoginRequest, request: Request) -> JSONResponse:
+        if not app.state.session_secret:
+            raise HTTPException(status_code=503, detail="Sign-in is not configured on this server.")
+        if locked_for(body.email):
+            raise HTTPException(status_code=429, detail="Too many tries. Wait a little, then try again.")
+        account = find_account_by_email(body.email)
+        if account is None or not verify_password(body.password, account.get("password")):
+            # Spend a hash when the email is missing so the two misses take similar time.
+            if account is None:
+                verify_password(body.password, dummy_password())
+            note_failure(body.email)
+            raise HTTPException(status_code=401, detail="That email or password does not match.")
+        clear_failures(body.email)
+        response = JSONResponse(public_account(account))
+        set_account_cookie(response, request, account["id"])
+        return response
+
+    @app.post("/logout")
+    def logout() -> JSONResponse:
+        response = JSONResponse({"signed_out": True})
+        response.delete_cookie(ACCOUNT_COOKIE, path="/")
+        return response
+
+    @app.get("/me")
+    def me(request: Request) -> dict[str, Any]:
+        account = require_account(request)
+        return public_account(account)
+
+    @app.post("/me/profile")
+    def set_profile(body: ProfileNameRequest, request: Request) -> dict[str, Any]:
+        account = require_account(request)
+        with accounts.session_scope(account["id"]):
+            current = accounts.get(account["id"]) or account
+            write_person_name(current, body.person_name)
+            accounts.put(current)
+        return public_account(current)
+
+    @app.post("/dev/sample", status_code=201)
+    def dev_sample() -> dict[str, Any]:
+        """Canned family for the advanced demo. No account. Stops before Qloo."""
+        session, token = domain.new_invite(SAMPLE["caregiver_label"])
+        attach_account(session, None)
+        try:
+            domain.add_upload(
+                session,
+                domain.UploadRequest(
+                    photo_path=SAMPLE["photo_path"],
+                    anecdote=SAMPLE["anecdote"],
+                    interests=list(SAMPLE["interests"]),
+                ),
+            )
+            domain.acknowledge_exclusions(
+                session,
+                domain.ExclusionsRequest(exclusions=list(SAMPLE["exclusions"])),
+            )
+        except domain.SessionError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        session["interview"]["committed"] = True
+        session["interview"]["answers"] = {"leave_out": "war documentaries"}
+        expired = {
+            sid
+            for sid, existing in store.read_all().items()
+            if domain.session_expired(existing, ttl)
+        }
+        if not store.insert_if_room(session, session_cap, expired):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"session limit reached ({session_cap}). Delete a session "
+                    "or wait for unused sessions to expire."
+                ),
+            )
+        return {
+            "session_id": session["id"],
+            "invite_token": token,
+            "caregiver_label": session["caregiver_label"],
+            "phase": "preview",
+            "note": "Sample family. Nothing is requested until you ask for the preview.",
+        }
+
     @app.post("/invites", status_code=201)
-    def create_invite(request: domain.InviteRequest) -> dict[str, Any]:
-        session, token = domain.new_invite(request.caregiver_label)
+    def create_invite(body: domain.InviteRequest, request: Request) -> dict[str, Any]:
+        account = require_account(request)
+        session, token = domain.new_invite(body.caregiver_label)
+        attach_account(session, account)
         expired = {
             sid
             for sid, existing in store.read_all().items()
@@ -302,6 +597,108 @@ def create_app(
         }
         body["guide"] = guide_status(session)
         return body
+
+    @app.get("/sessions/{session_id}/interview")
+    def get_interview(
+        session_id: str,
+        x_invite_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        with store.session_scope(session_id):
+            session = load_session(session_id, x_invite_token)
+            return interview_view(session)
+
+    @app.post("/sessions/{session_id}/interview")
+    def post_interview(
+        session_id: str,
+        turn: InterviewTurn,
+        x_invite_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        with store.session_scope(session_id):
+            session = load_session(session_id, x_invite_token)
+            try:
+                domain.require_open(session)
+            except domain.SessionError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            interview = session.setdefault("interview", fresh_interview())
+            if interview.get("committed"):
+                raise HTTPException(status_code=409, detail="The preview is already waiting.")
+            answers = dict(interview.get("answers") or {})
+            exited = bool(interview.get("exited"))
+            if turn.exit:
+                if not can_exit(answers, exited):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Stay for a few more questions. I can stop once the picture is clear.",
+                    )
+                interview["exited"] = True
+                exited = True
+            else:
+                probe = next_probe(answers, exited)
+                if probe is None:
+                    raise HTTPException(status_code=409, detail="There is no question waiting.")
+                try:
+                    text = validate_answer(probe, turn.text or "")
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                answers[probe["id"]] = text
+                interview["answers"] = answers
+                account_id = session.get("account_id")
+                if account_id:
+                    account = accounts.get(account_id)
+                    if account:
+                        write_probe(
+                            account,
+                            {
+                                "id": probe["id"],
+                                "topic": probe["topic"],
+                                "prompt": probe["ask"],
+                                "answer": text,
+                            },
+                        )
+                        save_account(account)
+            if next_probe(dict(interview.get("answers") or {}), bool(interview.get("exited"))) is None:
+                commit_interview(session)
+            store.put(session)
+            return interview_view(session)
+
+    @app.post("/sessions/{session_id}/feedback")
+    def post_feedback(
+        session_id: str,
+        turn: FeedbackTurn,
+        x_invite_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        with store.session_scope(session_id):
+            session = load_session(session_id, x_invite_token)
+            if not session.get("sealed"):
+                raise HTTPException(status_code=409, detail="The list comes first.")
+            text = " ".join(turn.text.split())
+            if not text:
+                raise HTTPException(status_code=422, detail="Say it in a few words.")
+            saved = dict(session.get("feedback") or {})
+            saved[turn.id] = text
+            saved["at"] = domain.now_utc()
+            session["feedback"] = saved
+            store.put(session)
+            account_id = session.get("account_id")
+            if account_id:
+                account = accounts.get(account_id)
+                if account:
+                    write_feedback(
+                        account,
+                        {
+                            "session_id": session_id,
+                            "fit": str(saved.get("fit") or ""),
+                            "next": str(saved.get("next") or ""),
+                            "at": str(saved.get("at") or ""),
+                        },
+                    )
+                    save_account(account)
+            pending = pending_feedback(saved)
+            return {
+                "saved": turn.id,
+                "pending": pending["id"] if pending else None,
+                "ask": pending["ask"] if pending else "Thank you. That is enough.",
+            }
 
     @app.post("/sessions/{session_id}/uploads", status_code=201)
     def add_upload(
@@ -527,9 +924,8 @@ def create_app(
                     status_code=409,
                     detail={
                         "message": (
-                            "Spotify is not configured on this server. Download the M3U "
-                            "or open the search links. Ask the operator for SPOTIFY_CLIENT_ID "
-                            "and the redirect URI in the Spotify dashboard."
+                            "A private Spotify playlist is not connected yet. "
+                            "Download the listening file, or open the search links."
                         ),
                         "fallback": "m3u",
                     },

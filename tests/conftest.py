@@ -1,5 +1,6 @@
 """Shared fixtures: repo root on sys.path, a canned Qloo double, flow helpers."""
 
+import secrets
 import sys
 from pathlib import Path
 
@@ -58,11 +59,27 @@ def fake_qloo() -> FakeQloo:
     return FakeQloo()
 
 
+@pytest.fixture(autouse=True)
+def tuck_session_secret(monkeypatch):
+    monkeypatch.setenv("SESSION_SECRET", "tuck-test-secret")
+
+
 @pytest.fixture
 def client(tmp_path, fake_qloo) -> TestClient:
     return TestClient(
         create_app(store_path=tmp_path / "store.json", qloo=fake_qloo, spotify_client_id="")
     )
+
+
+def open_account(client: TestClient, email: str | None = None) -> str:
+    """Register a caregiver. The session cookie stays on this client."""
+    email = email or f"caregiver-{secrets.token_hex(4)}@example.com"
+    response = client.post(
+        "/accounts",
+        json={"email": email, "password": "test-password-1"},
+    )
+    assert response.status_code == 201, response.text
+    return email
 
 
 def start_session(
@@ -72,7 +89,8 @@ def start_session(
     anecdote="Sunday records after church.",
     photo="/tmp/family/photo.jpg",
 ) -> tuple[str, dict[str, str]]:
-    """Invite + one upload. Returns (session_id, auth headers)."""
+    """Account, invite, and one upload. Returns (session_id, auth headers)."""
+    open_account(client)
     response = client.post("/invites", json={"caregiver_label": "Test caregiver"})
     assert response.status_code == 201, response.text
     invite = response.json()

@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Guided Memory Lane</title>
-  <meta name="description" content="Comfortable shared listening, after the family says what stays out.">
+  <title>Tuck</title>
+  <meta name="description" content="Tuck asks one question at a time, then makes a private listening gift.">
   <meta name="theme-color" content="#f6f1e7">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -12,126 +12,105 @@
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <a class="skip" href="#desk">Skip to the session</a>
+  <a class="skip" href="#ask">Skip to Tuck's question</a>
   <div class="page">
     <header class="mast">
-      <p class="wordmark">Guided Memory Lane</p>
-      <h1>Comfortable shared listening, after the family says what stays out.</h1>
-      <p class="lede">You open a session, name what the family wants left out, and sign a preview. Only then does the list of music, film, and places get requested.</p>
+      <p class="wordmark">Tuck</p>
+      <button type="button" class="secondary" id="sign-out" hidden>Sign out</button>
     </header>
 
-    <div class="layout">
-      <nav class="rail" aria-label="Session steps">
-        <button type="button" data-step="invite">Invite</button>
-        <button type="button" data-step="memory">Memory</button>
-        <button type="button" data-step="exclusions">Exclusions</button>
-        <button type="button" data-step="preview">Preview</button>
-        <button type="button" data-step="list">List</button>
-        <button type="button" data-step="playlist">Playlist</button>
-      </nav>
+    <main id="desk">
+      <p id="status" class="status" role="status"></p>
+      <p id="error" class="error" role="alert" hidden></p>
+      <h1 id="ask" tabindex="-1">What email should I use for your account?</h1>
+      <p id="aside" class="lede">I'm Tuck. I ask one thing at a time. I show you the list before anything goes to Spotify.</p>
 
-      <main id="desk">
-        <p id="status" class="status" role="status"></p>
-        <p id="error" class="error" role="alert" hidden></p>
+      <form id="form-email">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" autocomplete="username" required maxlength="120" inputmode="email">
+        <div class="actions">
+          <button class="primary" type="submit">Send</button>
+        </div>
+      </form>
 
-        <section id="panel-invite" aria-labelledby="invite-title">
-          <h2 id="invite-title" tabindex="-1">Open the session</h2>
-          <p id="guide-invite" class="guide"></p>
-          <form id="form-invite">
-            <label for="caregiver">Who is opening this session?</label>
-            <input id="caregiver" name="caregiver" maxlength="60" required autocomplete="name" placeholder="Name, and how they know the person">
-            <div class="actions">
-              <button class="primary" type="submit">Open a family session</button>
-              <button class="secondary" type="button" id="sample">Open the sample family</button>
-            </div>
-          </form>
-          <div id="invite-result" hidden>
-            <p>This invite token is shown once. It stays in this browser so you can finish the playlist.</p>
-            <p id="invite-token" class="token"></p>
-            <div class="actions">
-              <button type="button" class="secondary" id="copy-token">Copy the invite token</button>
-              <button type="button" class="primary" id="to-memory">Add a memory</button>
-            </div>
-          </div>
-        </section>
+      <div id="account-choice" hidden>
+        <div class="actions">
+          <button type="button" class="primary" id="choose-new">Make this my account</button>
+          <button type="button" class="secondary" id="choose-existing">I have an account</button>
+        </div>
+      </div>
 
-        <section id="panel-memory" hidden aria-labelledby="memory-title">
-          <h2 id="memory-title" tabindex="-1">Add one memory</h2>
-          <p id="guide-memory" class="guide"></p>
-          <form id="form-memory">
-            <label for="photo">Photo note</label>
-            <input id="photo" name="photo" maxlength="4096" required autocomplete="off" placeholder="A file name you will recognize">
-            <p class="hint">Stored as text. The photo is never opened or analyzed.</p>
-            <label for="anecdote">Anecdote</label>
-            <textarea id="anecdote" name="anecdote" maxlength="600" required rows="4" placeholder="A short note for the family record"></textarea>
-            <p class="hint">The anecdote stays here. It is not sent to Qloo.</p>
-            <label for="interests">Interests to start from</label>
-            <input id="interests" name="interests" required placeholder="Nat King Cole, jazz">
-            <p class="hint">Comma-separated. These are the only words that can become signals.</p>
-            <div class="actions">
-              <button class="primary" type="submit">Save this memory</button>
-            </div>
-          </form>
-          <p id="memory-result" class="result" hidden></p>
-        </section>
+      <form id="form-password" hidden>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="new-password" required minlength="10" maxlength="200">
+        <p class="hint">At least 10 characters.</p>
+        <div class="actions">
+          <button class="primary" type="submit">Send</button>
+        </div>
+      </form>
 
-        <section id="panel-exclusions" hidden aria-labelledby="exclusions-title">
-          <h2 id="exclusions-title" tabindex="-1">Say what stays out</h2>
-          <p id="guide-exclusions" class="guide"></p>
-          <form id="form-exclusions">
-            <div id="exclusion-rows"></div>
-            <div class="actions">
-              <button type="button" class="secondary" id="add-exclusion">Add another exclusion</button>
-            </div>
-            <div class="actions">
-              <button class="primary" type="submit">Record these exclusions</button>
-              <button type="button" class="secondary" id="exclude-none">Acknowledge nothing to exclude</button>
-            </div>
-          </form>
-          <div id="exclusion-result" hidden></div>
-        </section>
+      <form id="form-who" hidden>
+        <label for="who">Their name</label>
+        <input id="who" name="who" type="text" autocomplete="off" required maxlength="60">
+        <div class="actions">
+          <button class="primary" type="submit">Send</button>
+        </div>
+      </form>
 
-        <section id="panel-preview" hidden aria-labelledby="preview-title">
-          <h2 id="preview-title" tabindex="-1">Sign the boundary</h2>
-          <p id="guide-preview" class="guide"></p>
-          <form id="form-preview">
-            <p>Building the preview signs it. You will see the exact signal ids before any list is requested.</p>
-            <div class="actions">
-              <button class="primary" type="submit">Build the preview</button>
-            </div>
-          </form>
-          <article id="preview-sheet" class="sheet" hidden></article>
-          <div class="actions" id="preview-next" hidden>
-            <button type="button" class="primary" id="request-list">Request the list</button>
-          </div>
-        </section>
+      <div id="who-choice" hidden>
+        <div class="actions">
+          <button type="button" class="primary" id="who-yes">Yes, still them</button>
+          <button type="button" class="secondary" id="who-else">Someone else</button>
+        </div>
+      </div>
 
-        <section id="panel-list" hidden aria-labelledby="list-title">
-          <h2 id="list-title" tabindex="-1">The list</h2>
-          <p id="guide-list" class="guide"></p>
-          <div id="list-body"></div>
-          <div class="actions">
-            <button type="button" class="primary" id="to-playlist">Make the playlist</button>
-          </div>
-        </section>
+      <form id="form-answer" hidden>
+        <label for="answer" id="answer-label">Your answer</label>
+        <textarea id="answer" name="answer" rows="3" maxlength="600"></textarea>
+        <div class="actions">
+          <button type="button" class="secondary" id="mic" hidden>Speak, then edit</button>
+          <button class="primary" type="submit" id="send">Send</button>
+          <button type="button" class="secondary" id="exit" hidden>That's enough for a preview</button>
+        </div>
+      </form>
 
-        <section id="panel-playlist" hidden aria-labelledby="playlist-title">
-          <h2 id="playlist-title" tabindex="-1">Private playlist</h2>
-          <p id="guide-playlist" class="guide"></p>
-          <div id="playlist-body"></div>
-          <div class="actions">
-            <button type="button" class="secondary" id="clear-session">Clear this session</button>
-          </div>
-        </section>
-      </main>
-    </div>
+      <div id="preview-actions" hidden>
+        <div class="actions">
+          <button type="button" class="primary" id="build-preview">Show the preview</button>
+        </div>
+      </div>
+      <article id="preview-sheet" class="sheet" hidden></article>
+      <div id="list-actions" hidden>
+        <div class="actions">
+          <button type="button" class="primary" id="request-list">Ask for the list</button>
+        </div>
+      </div>
+
+      <article id="gift" class="sheet" hidden></article>
+      <div id="gift-actions" class="actions" hidden></div>
+
+      <form id="form-feedback" hidden>
+        <label for="feedback">Your note</label>
+        <textarea id="feedback" name="feedback" rows="3" maxlength="400" required></textarea>
+        <div class="actions">
+          <button class="primary" type="submit" id="feedback-send">Send</button>
+        </div>
+      </form>
+    </main>
+
+    <details class="advanced">
+      <summary>Advanced</summary>
+      <p>A sample family, for a demo. It still stops at the preview until you ask.</p>
+      <button type="button" class="secondary" id="sample">Open the sample family</button>
+    </details>
 
     <footer class="colophon">
-      <p>Photos are stored as a note and never opened. This is shared listening, not a medical device.</p>
+      <p>Most sittings run from about half an hour to two hours. Stop when it stops being easy.</p>
+      <p>This is shared listening. It is not therapy, and it does not treat anything.</p>
     </footer>
   </div>
   <noscript>
-    <p>This desk needs JavaScript to talk to the server. The README has the command-line path.</p>
+    <p>Tuck needs JavaScript for the conversation. The README has the command-line path.</p>
   </noscript>
   <script src="/static/app.js"></script>
 </body>

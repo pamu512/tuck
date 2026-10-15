@@ -8,6 +8,8 @@ services:
     envVars:
       - key: QLOO_API_KEY
         sync: false
+      - key: SESSION_SECRET
+        sync: false
       - key: SPOTIFY_CLIENT_ID
         sync: false
       - key: SPOTIFY_REDIRECT_URI

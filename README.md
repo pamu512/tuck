@@ -1,10 +1,10 @@
-# Guided Memory Lane
+# Tuck
 
-Comfortable shared listening, after the family says what stays out.
+Tuck asks one question at a time, then makes a private listening gift.
 
-A caregiver opens an invite, adds a photo note and a short anecdote, records what the family wants left out, and signs a preview. Only then does the desk request Qloo cultural-affinity candidates (music, film, place) and offer a private playlist.
+You make an account (email and a password), say who you are helping, and answer Tuck. Tuck keeps those answers as you typed them. Exclusions and a preview come before any request, and again before a private Spotify playlist. If Spotify is not connected, the gift is a listening file and search links.
 
-Built for the Qloo Agentic Hackathon (deadline Oct 30, 2026). The live desk is the site root: [guided-memory-lane.onrender.com](https://guided-memory-lane.onrender.com).
+Built for the Qloo Agentic Hackathon (deadline Oct 30, 2026). The live guide is the site root: [guided-memory-lane.onrender.com](https://guided-memory-lane.onrender.com).
 
 ## Claim boundary (locked 2026-10-13)
 
@@ -29,7 +29,7 @@ These lists are enforced in code (`app/session.py`), not just documented: the cl
 
 ## Safety invariants and where they live
 
-1. Invite-first. `POST /invites` issues a one-time token; every session route requires it (`X-Invite-Token` header). Tokens are stored as SHA-256 hashes and compared in constant time.
+1. Account first, then the invite token. `POST /accounts` and `POST /login` set an HttpOnly cookie signed with `SESSION_SECRET` (environment or the local secrets file; the value is never committed or printed). `POST /invites` requires that cookie. Session routes still require the one-time `X-Invite-Token`. `POST /dev/sample` is the only session without an account, and it only loads the canned sample family. The sample button sits under Advanced.
 2. Exclusions before any recommendation. `POST /sessions/{id}/preview` and `POST /sessions/{id}/candidates` refuse with 409 until `POST /sessions/{id}/exclusions` has run. An empty list counts as a deliberate acknowledgment; changing exclusions later invalidates the preview so it must be re-signed. Acknowledgment tries to resolve each label to a Qloo tag or entity id (`search_tags` / `search_entities`) and filters on that id when it hits. Labels that do not resolve are returned in `unresolved_exclusions` and still filter by name, which can miss paraphrases. Exclusions filter both the signals sent to Qloo and the candidates returned.
 3. Photos are opaque. The photo path is stored as a metadata string. It is never opened, read, or analyzed; there is no vision model anywhere. `tests/test_no_invented_bio.py` sabotages `open()` for image files and proves the full flow still works.
 4. Anecdotes are display-only. Anecdote text stays in the local family record and is never sent to Qloo. Qloo signals come exclusively from caregiver-typed interests. Interests that do not resolve to a Qloo tag or entity are reported as unresolved, never guessed.
@@ -58,7 +58,7 @@ Notes verified against the live API and the hackathon developer guide:
     pip install -r requirements.txt
     uvicorn app.main:app --port 8000
 
-Open `http://127.0.0.1:8000/`. That page is the caregiver desk (invite, memory, exclusions, preview, list, playlist). It is not an API docs screen.
+Open `http://127.0.0.1:8000/`. Tuck asks for an email, then one question at a time. The sample family is under Advanced, and it stops at the preview until you ask for the list.
 
 Preview and candidates need the key (503 if it is missing). Exclusion acknowledgment also tries Qloo; if that lookup fails, the labels are still saved and listed in `unresolved_exclusions`.
 
@@ -72,16 +72,16 @@ The browser step is Authorization Code with PKCE. No client secret is used or st
 
 `SPOTIFY_REDIRECT_URI=https://guided-memory-lane.onrender.com/spotify/callback`
 
-If `SPOTIFY_CLIENT_ID` is empty, the desk does not dead-end. It downloads an M3U and offers Spotify search links for the music names that cleared the exclusions. YouTube Music and Apple Music are not in this build.
+If Spotify is not connected, the guide does not dead-end. It downloads a listening file and offers Spotify search links for the music names that cleared the exclusions. YouTube Music, Apple Music, and Spotify Connect are not in this build.
 
-Ask for the Spotify client id from the dashboard owner if the live private playlist is required. Do not commit the id or any Spotify secret.
+`SPOTIFY_CLIENT_ID` is set in the server environment when a private playlist should be available. Do not commit it.
 
 ## Demo CLI
 
     python demo_cli.py               # dry-run: in-process app, canned Qloo, no key, no network
     python demo_cli.py --mode live   # against a running server that holds the key
 
-Dry-run forces the M3U path so the script does not depend on a Spotify client id. Live mode prints whichever export the server is configured for. The private playlist itself is finished in the browser, because Spotify has to send the caregiver back to `/spotify/callback`.
+Dry-run leaves Spotify unset, so the listening file is the gift. Live mode prints whichever export the server is configured for. The private playlist itself is finished in the browser, because Spotify has to send the caregiver back to `/spotify/callback`.
 
 ## Tests
 
@@ -93,7 +93,10 @@ No network, no API key: tests inject a canned Qloo double and a temporary store.
 
 | Route | Body | Result |
 | --- | --- | --- |
-| POST /invites | `{"caregiver_label"}` | session ID plus one-time invite token |
+| POST /accounts | `{"email", "password"}` | account cookie; password is stored as a hash |
+| POST /login | `{"email", "password"}` | account cookie |
+| POST /me/profile | `{"person_name"}` | durable name of the person you are helping |
+| POST /invites | `{"caregiver_label"}` | session ID plus one-time invite token; requires the account cookie |
 | POST /sessions/{id}/uploads | `{"photo_path", "anecdote", "interests"}` | upload receipt; photo never opened |
 | POST /sessions/{id}/exclusions | `{"exclusions": [{"label", "kind", "reason"}]}` | acknowledgment (empty list allowed); unresolved labels are listed |
 | POST /sessions/{id}/preview | none | exact signals Qloo will receive, withheld items, claims |
@@ -103,7 +106,7 @@ No network, no API key: tests inject a canned Qloo double and a temporary store.
 | POST /sessions/{id}/candidates | none | filtered music/film/place candidates; anecdote and photo path are then cleared |
 | GET /sessions/{id}/export | none | playlist plan: tracks, withheld names, M3U-or-Spotify mode |
 | GET /sessions/{id}/playlist.m3u | none | M3U download (invite header, not a query token) |
-| POST /sessions/{id}/spotify/start | none | Spotify authorize URL, or 409 with `fallback: m3u` when no client id |
+| POST /sessions/{id}/spotify/start | none | Spotify authorize URL, or 409 with `fallback: m3u` when Spotify is not connected |
 | GET /spotify/callback | Spotify redirect | exchanges the code and creates the private playlist |
 | DELETE /sessions/{id} | none | delete the session and its anecdotes before completion |
 
@@ -139,4 +142,4 @@ Blueprint: `render.yaml`.
 
 Set `QLOO_API_KEY` in the Render Dashboard. The blueprint names the variable only; never commit the value.
 
-`SPOTIFY_CLIENT_ID` and `SPOTIFY_REDIRECT_URI` are optional. Without the client id, `/` still serves the desk and the sample family ends on the M3U. The redirect URI must match the Spotify app exactly, including the path `/spotify/callback`.
+`SESSION_SECRET`, `SPOTIFY_CLIENT_ID`, and `SPOTIFY_REDIRECT_URI` come from the environment. Without Spotify configured, `/` still serves Tuck and the listening file is the gift. The redirect URI must match the Spotify app exactly, including the path `/spotify/callback`.
