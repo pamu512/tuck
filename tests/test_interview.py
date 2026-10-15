@@ -2,7 +2,8 @@
 
 import json
 
-from app.interview import can_exit, materialize, next_probe, persona_summary
+from app.interview import can_exit, materialize, next_probe, persona_summary, soft_normalize_interest
+from app.session import candidate_reason, resolve_signals
 
 
 def _short_answers():
@@ -67,7 +68,8 @@ def test_none_is_not_stored_as_an_interest_or_an_exclusion():
             "leave_out": "none",
         }
     )
-    assert built["interests"] == ["gardening", "jazz", "musicals"]
+    # Music/film answers are retained ahead of hobby probes.
+    assert built["interests"] == ["jazz", "musicals", "gardening"]
     assert built["exclusions"] == []
     assert built["photo_path"] == "not-provided"
     assert "Sunday" in built["anecdote"]
@@ -313,3 +315,51 @@ def test_persona_summary_from_sample_answers():
 def test_persona_summary_does_not_invent_from_empty():
     portrait = persona_summary(interests=[], habits=[], anecdote="", exclusions=[])
     assert "still need" in portrait["persona_summary"].casefold()
+
+
+def test_materialize_keeps_music_and_film_when_hands_fill_early_slots():
+    """Hobby comma-lists must not zero out later music/film probe answers."""
+    built = materialize(
+        {
+            "hands": (
+                "Dogs, Detallado Inteligente Motorcyles, Music, Audiophile, "
+                "Cooking, Woodworking supply store"
+            ),
+            "place": "Garage, Colombo",
+            "moment": "An ordinary afternoon.",
+            "music": "Named Singer One, Named Band Two, Named Song Three",
+            "film": "Named Film One, Named Film Two",
+        }
+    )
+    interests = built["interests"]
+    for name in (
+        "Named Singer One",
+        "Named Band Two",
+        "Named Song Three",
+        "Named Film One",
+        "Named Film Two",
+    ):
+        assert name in interests, interests
+    # Cultural answers come before hobby overflow.
+    assert interests.index("Named Singer One") < interests.index("Dogs")
+    assert "Detallado Inteligente motorcycles" in interests
+    assert soft_normalize_interest("Motorcyles") == "motorcycles"
+
+
+def test_candidate_reason_is_short_not_a_laundry_list():
+    signals = [
+        {"name": name, "kind": "tag", "id": f"t-{i}", "interest": name}
+        for i, name in enumerate(
+            ["Dogs", "Motorcycles", "Cooking", "Garage", "Colombo", "Music"]
+        )
+    ]
+    why = candidate_reason("Some Suggested Artist", signals)
+    assert "Cultural affinity with stated interests" not in why
+    assert why.count(",") == 0
+    assert why.startswith("Near ")
+    assert len(why) < 80
+    direct = candidate_reason(
+        "Named Singer One",
+        [{"name": "Named Singer One", "kind": "entity", "id": "E1", "interest": "Named Singer One"}],
+    )
+    assert direct.startswith("Matches what you named:")

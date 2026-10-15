@@ -33,6 +33,7 @@ A successful candidates response seals the session.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from pathlib import Path
@@ -100,6 +101,8 @@ from .interview import (
 from .qloo import INSIGHT_TYPES, QlooAuthError, QlooClient, QlooUpstreamError
 from .sample import SAMPLE
 from .store import JsonStore, StoreError
+
+_spotify_log = logging.getLogger("tuck.spotify")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -1120,12 +1123,60 @@ def create_app(
                 playlist_description(job["label"]),
             )
             api.add_tracks(access_token, created["id"], uris)
-        except (SpotifyError, httpx.HTTPError):
+        except SpotifyError as exc:
             if created is not None and access_token:
                 try:
                     api.discard_playlist(access_token, str(created["id"]))
                 except (SpotifyError, httpx.HTTPError):
                     pass
+            detail = str(exc)
+            for secret in (access_token, code, str(job.get("verifier") or "")):
+                if secret:
+                    detail = detail.replace(secret, "[REDACTED]")
+            detail = detail[:180]
+            folded = detail.casefold()
+            err_code = (
+                "token"
+                if ("access token" in folded or "token response" in folded)
+                else "upstream"
+            )
+            _spotify_log.warning(
+                "spotify callback failed session=%s err=%s detail=%s",
+                session_id,
+                err_code,
+                detail,
+            )
+            try:
+                with store.session_scope(session_id):
+                    session = store.get(session_id)
+                    if session is not None:
+                        session["playlist_error"] = {"code": err_code, "detail": detail}
+                        store.put(session)
+            except Exception:
+                pass
+            return playlist_redirect("error", err_code)
+        except httpx.HTTPError as exc:
+            if created is not None and access_token:
+                try:
+                    api.discard_playlist(access_token, str(created["id"]))
+                except (SpotifyError, httpx.HTTPError):
+                    pass
+            _spotify_log.warning(
+                "spotify callback http failed session=%s err=%s",
+                session_id,
+                type(exc).__name__,
+            )
+            try:
+                with store.session_scope(session_id):
+                    session = store.get(session_id)
+                    if session is not None:
+                        session["playlist_error"] = {
+                            "code": "upstream",
+                            "detail": type(exc).__name__,
+                        }
+                        store.put(session)
+            except Exception:
+                pass
             return playlist_redirect("error", "upstream")
         finally:
             api.close()

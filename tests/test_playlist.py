@@ -388,3 +388,73 @@ def test_a_failed_track_add_discards_the_empty_playlist(tmp_path, fake_qloo):
     assert "spot-access-token" not in callback.headers["location"]
     assert seen.get("discarded") is True
     assert client.app.state.store.get(session_id).get("playlist") is None
+
+
+def test_spotify_callback_accepts_create_response_without_public_field(tmp_path, fake_qloo):
+    """Live Spotify may omit public on create; missing must not become upstream."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/token":
+            return httpx.Response(200, json={"access_token": "spot-access-token"})
+        if request.url.path == "/v1/search":
+            return httpx.Response(
+                200,
+                json={
+                    "tracks": {
+                        "items": [
+                            {
+                                "id": "good",
+                                "uri": "spotify:track:good",
+                                "name": "So What",
+                                "artists": [{"name": "Miles Davis"}],
+                                "album": {"name": "Kind of Blue"},
+                            }
+                        ]
+                    }
+                },
+            )
+        if request.url.path == "/v1/me/playlists" and request.method == "POST":
+            payload = json.loads(request.content.decode())
+            seen["create"] = payload
+            # Deliberately omit public — the live API often does.
+            return httpx.Response(
+                201,
+                json={
+                    "id": "pl-nopublic",
+                    "name": payload["name"],
+                    "external_urls": {"spotify": "https://open.spotify.com/playlist/pl-nopublic"},
+                },
+            )
+        if request.url.path == "/v1/playlists/pl-nopublic/items":
+            return httpx.Response(201, json={"snapshot_id": "snap"})
+        return httpx.Response(404, json={"error": "missing"})
+
+    def factory(redirect_uri: str) -> SpotifyAPI:
+        return SpotifyAPI("test-client", redirect_uri, transport=httpx.MockTransport(handler))
+
+    client = TestClient(
+        create_app(
+            store_path=tmp_path / "store.json",
+            qloo=fake_qloo,
+            spotify_client_id="test-client",
+            spotify_factory=factory,
+        )
+    )
+    session_id, headers = start_session(client)
+    _reach_export(client, headers, session_id, [])
+    start = client.post(f"/sessions/{session_id}/spotify/start", headers=headers)
+    assert start.status_code == 200, start.text
+    state = client.app.state.store.get(session_id)["spotify_oauth"]["state"]
+    callback = client.get(
+        "/spotify/callback",
+        params={"code": "auth-code", "state": state},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    assert "playlist=ready" in callback.headers["location"]
+    assert "code=upstream" not in callback.headers["location"]
+    assert seen["create"]["public"] is False
+    stored = client.app.state.store.get(session_id)
+    assert stored["playlist"]["id"] == "pl-nopublic"
+    assert stored["playlist"]["public"] is False

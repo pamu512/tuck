@@ -6,7 +6,10 @@ should stay out before a preview can be built.
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+from .session import MAX_TOTAL_INTERESTS
 
 NONE_WORDS = frozenset({"none", "nothing", "no", "n/a", "na", "skip", "nothing else"})
 MIN_ANSWERS_BEFORE_EXIT = 8
@@ -203,31 +206,66 @@ def validate_answer(probe: dict[str, Any], text: str) -> str:
     return text
 
 
+_TYPO_FIXES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bmotorcyles\b", re.IGNORECASE), "motorcycles"),
+)
+
+# Music and film answers must survive when early hobby probes fill many phrases.
+_CULTURAL_TOPICS = frozenset({"music", "movies"})
+
+
+def soft_normalize_interest(phrase: str) -> str:
+    """Fix a few obvious typos. Does not invent names or expand biography."""
+    out = " ".join(phrase.split())
+    for pattern, repl in _TYPO_FIXES:
+        out = pattern.sub(repl, out)
+    return out
+
+
 def materialize(answers: dict[str, str]) -> dict[str, Any]:
-    """Turn stored answers into upload fields. Skipped and 'none' add nothing."""
-    interests: list[str] = []
+    """Turn stored answers into upload fields. Skipped and 'none' add nothing.
+
+    Early hobby probes can emit many comma-separated phrases. Cap retention is
+    topic-aware: music and film answers are kept before hobbies/places so a
+    long hands/place list cannot zero out named cultural entities.
+    """
+    cultural: list[str] = []
+    other: list[str] = []
     exclusions: list[str] = []
     habits: list[dict[str, str]] = []
     seen: set[str] = set()
+
+    def _add(phrase: str, bucket: list[str]) -> None:
+        cleaned = soft_normalize_interest(phrase)
+        key = cleaned.casefold()
+        if not cleaned or key in seen:
+            return
+        seen.add(key)
+        bucket.append(cleaned)
+
     for probe in PROBES:
         text = answers.get(probe["id"])
         if not text:
             continue
         kind = probe["writes"]
         if kind == "interest":
+            bucket = cultural if probe["topic"] in _CULTURAL_TOPICS else other
             for phrase in _phrases(text):
-                key = phrase.casefold()
-                if key in seen:
-                    continue
-                seen.add(key)
-                interests.append(phrase)
+                _add(phrase, bucket)
         elif kind == "habit" and text.casefold() not in NONE_WORDS:
             habits.append({"id": probe["id"], "text": text})
         elif kind == "exclusion":
             exclusions.extend(_phrases(text))
+    # Cultural first, then fill remaining slots with hobbies/places.
+    interests = list(cultural)
+    if len(interests) > MAX_TOTAL_INTERESTS:
+        interests = interests[:MAX_TOTAL_INTERESTS]
+    else:
+        room = MAX_TOTAL_INTERESTS - len(interests)
+        interests.extend(other[:room])
     anecdote = (answers.get("moment") or "").strip()
     return {
-        "interests": interests[:8],
+        "interests": interests,
         "exclusions": exclusions[:12],
         "habits": habits,
         "anecdote": anecdote,

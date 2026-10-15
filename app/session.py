@@ -34,8 +34,8 @@ from .qloo import INSIGHT_TYPES
 
 MAX_UPLOADS_PER_SESSION = 20
 MAX_ANECDOTE_CHARS = 600
-MAX_INTERESTS_PER_UPLOAD = 8
-MAX_TOTAL_INTERESTS = 8
+MAX_INTERESTS_PER_UPLOAD = 16
+MAX_TOTAL_INTERESTS = 16
 MIN_INTEREST_CHARS = 3
 MAX_INTEREST_CHARS = 80
 MAX_PHOTO_PATH_CHARS = 4096
@@ -658,13 +658,18 @@ def filter_candidates(
 
 
 def candidate_reason(name: str, signals: list[dict[str, Any]]) -> str:
-    """Why a candidate is shown, anchored only in stated interests."""
+    """Short why-line for one row. Never paste the full interest list."""
     folded = name.casefold()
     for signal in signals:
         if signal["name"].casefold() == folded:
-            return f"Directly matches the family's stated interest: {signal['name']}"
-    names = ", ".join(dict.fromkeys(signal["name"] for signal in signals))
-    return f"Cultural affinity with stated interests: {names or 'family interests'}"
+            return f"Matches what you named: {signal['name']}"
+    for signal in signals:
+        if signal.get("kind") == "entity":
+            return f"Near {signal['name']}"
+    for signal in signals:
+        if signal.get("kind") == "tag":
+            return f"Near {signal['name']}"
+    return ""
 
 
 # --------------------------------------------------------------------------

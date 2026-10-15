@@ -262,7 +262,7 @@ class SpotifyAPI:
         client_id: str,
         redirect_uri: str,
         transport: httpx.BaseTransport | None = None,
-        timeout: float = 15.0,
+        timeout: float = 30.0,
     ) -> None:
         self.client_id = client_id.strip()
         self.redirect_uri = redirect_uri.strip()
@@ -351,12 +351,14 @@ class SpotifyAPI:
         )
         self._raise(response, token)
         body = response.json() or {}
-        if body.get("public") is not False:
-            raise SpotifyError("Spotify did not confirm the playlist is private.")
         playlist_id = body.get("id")
         url = ((body.get("external_urls") or {}).get("spotify")) or ""
         if not playlist_id or not url:
             raise SpotifyError("Spotify playlist response was missing an id or url.")
+        # We requested public:false. Live Spotify sometimes omits the public
+        # field on create; treat missing as OK. Only fail if it is explicitly true.
+        if body.get("public") is True:
+            raise SpotifyError("Spotify created a public playlist; expected private.")
         return {"id": str(playlist_id), "url": str(url), "public": False, "name": name}
 
     def add_tracks(self, token: str, playlist_id: str, uris: list[str]) -> None:

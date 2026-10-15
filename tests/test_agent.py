@@ -43,3 +43,51 @@ def test_guide_refuses_candidates_until_preview_is_signed(client, fake_qloo):
     assert allowed.json()["input"] == {"interests": ["jazz", "Nat King Cole"]}
     assert "pigeon" not in allowed.text
     assert "bakery" not in allowed.text
+
+
+def test_named_music_and_film_interests_reach_insights_as_entities(client, fake_qloo):
+    """Named cultural answers must resolve to entity signals in Insights params."""
+    fake_qloo.entities.update(
+        {
+            "named singer one": [
+                {"entity_id": "E-SINGER-1", "name": "Named Singer One"}
+            ],
+            "named film one": [
+                {"entity_id": "E-FILM-1", "name": "Named Film One"}
+            ],
+        }
+    )
+    session_id, headers = start_session(
+        client,
+        interests=[
+            "Dogs",
+            "Motorcycles",
+            "Cooking",
+            "Garage",
+            "Colombo",
+            "Music",
+            "Named Singer One",
+            "Named Film One",
+        ],
+    )
+    acknowledge(client, session_id, headers, [])
+    preview = run_to_preview(client, session_id, headers)
+    kinds = {signal["kind"] for signal in preview["signals"]}
+    ids = {signal["id"] for signal in preview["signals"]}
+    assert "entity" in kinds
+    assert "E-SINGER-1" in ids
+    assert "E-FILM-1" in ids
+
+    response = client.post(f"/sessions/{session_id}/candidates", headers=headers)
+    assert response.status_code == 200, response.text
+    insight_calls = [call for call in fake_qloo.calls if call[0] == "insights"]
+    assert insight_calls
+    entity_args = set()
+    for call in insight_calls:
+        # ("insights", entity_type, signal_tags, signal_entities)
+        entity_args.update(call[3])
+    assert "E-SINGER-1" in entity_args
+    assert "E-FILM-1" in entity_args
+    for row in response.json().get("candidates") or []:
+        why = row.get("why") or ""
+        assert "Cultural affinity with stated interests" not in why
