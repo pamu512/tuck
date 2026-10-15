@@ -121,6 +121,50 @@ def test_real_qloo_client_uses_get_and_strips_biography():
     ]
 
 
+
+def test_insights_joins_multiple_tags_into_one_query_param():
+    """Hackathon API 500s on repeated signal.interests.tags; comma-join required.
+
+    Live check 2026-10-15 against hackathon.api.qloo.com: repeated tags params
+    raise TypeError Cannot use 'in' operator to search for 'tag' in urn:tag:...
+    while a single comma-joined value returns 200. Entities stay repeatable.
+    """
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        # QueryParams.get_list preserves multiplicity; dict() collapses.
+        seen["tag_values"] = list(request.url.params.get_list("signal.interests.tags"))
+        seen["entity_values"] = list(request.url.params.get_list("signal.interests.entities"))
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={"success": True, "results": {"entities": []}},
+        )
+
+    client = QlooClient(api_key="test-key", transport=httpx.MockTransport(handler))
+    client.insights(
+        "urn:entity:artist",
+        signal_tags=[
+            "urn:tag:genre:music:jazz",
+            "urn:tag:genre:music:blues",
+        ],
+        signal_entities=["E1", "E2"],
+        take=3,
+    )
+    client.close()
+
+    assert seen["method"] == "GET"
+    # Exactly one tags param, comma-joined — not two repeated keys.
+    assert seen["tag_values"] == ["urn:tag:genre:music:jazz,urn:tag:genre:music:blues"]
+    assert seen["params"]["signal.interests.tags"] == (
+        "urn:tag:genre:music:jazz,urn:tag:genre:music:blues"
+    )
+    # Entities remain repeatable (verified OK on hackathon API).
+    assert seen["entity_values"] == ["E1", "E2"]
+    assert seen["params"]["take"] == "3"
+
+
 def test_loose_tag_matches_are_rejected_not_guessed(client, fake_qloo):
     """Encodes a live failure seen on 2026-10-13: the tag endpoint loosely
     matched the person-name interest "Nat King Cole" to an unrelated

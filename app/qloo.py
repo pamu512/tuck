@@ -7,8 +7,9 @@ Endpoints used by Guided Memory Lane:
 
 The Insights endpoint is GET-only: per the hackathon developer guide, POST
 with a JSON body fails even when the parameters are correct. filter.type
-must be a single supported URN; signals travel as repeatable
-signal.interests.tags and signal.interests.entities query parameters.
+must be a single supported URN. signal.interests.tags must be a single
+comma-joined query parameter (repeated tags params 500 on the hackathon
+API); signal.interests.entities may be repeated.
 
 The API key travels only in the X-Api-Key header. It is never logged,
 embedded in error messages, or returned to callers.
@@ -171,7 +172,10 @@ class QlooClient:
         if entity_type not in TYPE_LABELS:
             raise QlooError(f"unsupported insight type: {entity_type}")
         params: list[tuple[str, str]] = [("filter.type", entity_type), ("take", str(take))]
-        params += [("signal.interests.tags", tag) for tag in signal_tags]
+        # Hackathon API: repeated signal.interests.tags params 500 with
+        # TypeError on 'in' for 'tag'; one comma-joined value is required.
+        if signal_tags:
+            params.append(("signal.interests.tags", ",".join(signal_tags)))
         params += [("signal.interests.entities", entity) for entity in signal_entities]
         data = self._request("GET", "/v2/insights", params=params)
         entities = (data.get("results") or {}).get("entities") or []
