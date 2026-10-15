@@ -296,7 +296,7 @@ async function requestList() {
   if (state.busy) return;
   setBusy(true);
   setError("");
-  setStatus("Asking for the list. This can take up to half a minute.");
+  setStatus("Asking for the list. This can take up to a couple of minutes.");
   const progress = window.setInterval(() => {
     if (!state.busy) return;
     if (statusEl.textContent.indexOf("still working") === -1) {
@@ -307,7 +307,7 @@ async function requestList() {
     await api(`/sessions/${state.sessionId}/candidates`, {
       method: "POST",
       token: state.token,
-      timeoutMs: 25000,
+      timeoutMs: 120000,
     });
     setStatus("The list is ready. Opening the listening gift.");
     await showGift();

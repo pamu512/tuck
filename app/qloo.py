@@ -82,7 +82,7 @@ class QlooClient:
         self,
         api_key: str | None = None,
         base_url: str | None = None,
-        timeout: float = 15.0,
+        timeout: float = 40.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         resolved_key = (api_key or "").strip() or load_api_key()
@@ -113,7 +113,7 @@ class QlooClient:
         params: list[tuple[str, str]] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
-        """One request with a single retry on 429/5xx. Key-safe errors."""
+        """One request with a single retry on timeout/429/5xx. Key-safe errors."""
         last_error = "no attempt made"
         for attempt in (1, 2):
             try:
@@ -123,8 +123,15 @@ class QlooClient:
                     params=httpx.QueryParams(tuple(params)) if params else None,
                     json=json_body,
                 )
+            except httpx.TimeoutException as exc:
+                last_error = f"network error: {exc.__class__.__name__}"
+                if attempt == 1:
+                    time.sleep(1.2)
+                continue
             except httpx.HTTPError as exc:
                 last_error = f"network error: {exc.__class__.__name__}"
+                if attempt == 1:
+                    time.sleep(0.5)
                 continue
             if response.status_code in (429, 502, 503, 504) and attempt == 1:
                 last_error = f"HTTP {response.status_code}"

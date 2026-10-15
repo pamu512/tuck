@@ -6,6 +6,7 @@ import builtins
 import json
 
 import httpx
+import pytest
 
 from app.qloo import QlooClient
 from conftest import acknowledge, run_to_preview, start_session
@@ -191,3 +192,76 @@ def test_preview_carries_claim_boundary(client):
     assert any("biography" in item.lower() for item in claims["wont"])
     assert "never sent" in preview["what_qloo_receives"]["note"]
     assert preview["disclaimer"]
+
+
+def test_qloo_client_default_timeout_is_raised():
+    """Live 2026-10-15: music/film/place all ReadTimeout at 15s. Default is now 40s."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": {"entities": []}})
+
+    client = QlooClient(api_key="test-key", transport=httpx.MockTransport(handler))
+    try:
+        assert client._http.timeout.read == 40.0
+    finally:
+        client.close()
+
+
+def test_insights_retries_read_timeout_with_backoff(monkeypatch):
+    """ReadTimeout on GET /v2/insights backs off once, then succeeds."""
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("app.qloo.time.sleep", fake_sleep)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise httpx.ReadTimeout("simulated read timeout", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "results": {
+                    "entities": [
+                        {
+                            "entity_id": "e1",
+                            "name": "Retry Artist",
+                            "subtype": "urn:entity:artist",
+                            "properties": {},
+                        }
+                    ]
+                }
+            },
+        )
+
+    client = QlooClient(api_key="test-key", transport=httpx.MockTransport(handler))
+    try:
+        out = client.insights("urn:entity:artist", signal_tags=["urn:tag:genre:music:jazz"], take=3)
+    finally:
+        client.close()
+    assert attempts["n"] == 2
+    assert sleeps and sleeps[0] >= 1.0
+    assert out[0]["name"] == "Retry Artist"
+    assert "biography" not in out[0]
+
+
+def test_insights_read_timeout_exhausted_raises_upstream(monkeypatch):
+    monkeypatch.setattr("app.qloo.time.sleep", lambda _s: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated read timeout", request=request)
+
+    client = QlooClient(api_key="test-key", transport=httpx.MockTransport(handler))
+    try:
+        from app.qloo import QlooUpstreamError
+
+        with pytest.raises(QlooUpstreamError) as excinfo:
+            client.insights("urn:entity:artist", signal_tags=["urn:tag:genre:music:jazz"], take=3)
+        assert "ReadTimeout" in str(excinfo.value)
+        assert "test-key" not in str(excinfo.value)
+    finally:
+        client.close()
