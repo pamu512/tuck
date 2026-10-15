@@ -678,8 +678,9 @@ def preview_payload(
     kept_signals: list[dict[str, Any]],
     withheld: list[dict[str, Any]],
     unresolved: list[str],
+    persona: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    body: dict[str, Any] = {
         "session_id": session["id"],
         "caregiver_label": session["caregiver_label"],
         "photo_count": len(session["uploads"]),
@@ -705,6 +706,11 @@ def preview_payload(
             "background": COCHRANE_BACKGROUND,
         },
     }
+    if persona:
+        body["persona_summary"] = persona.get("persona_summary") or ""
+        body["persona_facets"] = persona.get("facets") or {}
+        body["qloo_plain"] = persona.get("qloo_plain") or ""
+    return body
 
 
 def seal_for_export(session: dict[str, Any], payload: dict[str, Any]) -> None:

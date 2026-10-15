@@ -2,7 +2,7 @@
 
 import json
 
-from app.interview import can_exit, materialize, next_probe
+from app.interview import can_exit, materialize, next_probe, persona_summary
 
 
 def _short_answers():
@@ -135,6 +135,13 @@ def test_interview_commits_without_insights_and_stores_feedback(client, fake_qlo
     assert listed.status_code == 200, listed.text
     assert any(call[0] == "insights" for call in fake_qloo.calls)
 
+    skipped = client.post(
+        f"/sessions/{session_id}/feedback",
+        json={"id": "next", "text": "Ask about Sunday sooner."},
+        headers=headers,
+    )
+    assert skipped.status_code == 409
+
     first = client.post(
         f"/sessions/{session_id}/feedback",
         json={"id": "fit", "text": "It felt like her."},
@@ -182,6 +189,96 @@ def test_sign_in_is_refused_when_unconfigured(tmp_path, fake_qloo):
     assert "tuck-spotify" not in response.text
 
 
+def test_sign_out_ends_the_cookie(client):
+    from conftest import open_account
+
+    open_account(client, "signed-out@example.com")
+    assert client.get("/me").status_code == 200
+    stolen = client.cookies.get("tuck_account")
+    assert stolen
+    signed_out = client.post("/logout")
+    assert signed_out.status_code == 200
+    assert "signed-out@example.com" not in signed_out.text
+    assert client.get("/me").status_code == 401
+    client.cookies.set("tuck_account", stolen)
+    refused = client.get("/me")
+    assert refused.status_code == 401
+    assert "password" not in refused.text.lower()
+
+
+def test_a_rewritten_cookie_is_refused(client):
+    from conftest import open_account
+
+    open_account(client, "tamper@example.com")
+    client.cookies.set("tuck_account", "a_notreal.9999999999.0." + ("ab" * 32))
+    refused = client.get("/me")
+    assert refused.status_code == 401
+    assert "tamper@example.com" not in refused.text
+
+
+def test_repeated_misses_lock_the_account(client):
+    from app.accounts import clear_failures
+
+    email = "lock@example.com"
+    clear_failures(email)
+    created = client.post(
+        "/accounts",
+        json={"email": email, "password": "test-password-1"},
+    )
+    assert created.status_code == 201, created.text
+    for _ in range(8):
+        missed = client.post("/login", json={"email": email, "password": "wrong-password-1"})
+        assert missed.status_code == 401, missed.text
+        assert "test-password-1" not in missed.text
+    locked = client.post("/login", json={"email": email, "password": "test-password-1"})
+    assert locked.status_code == 429
+    assert "test-password-1" not in locked.text
+    clear_failures(email)
+
+
+def test_the_account_cookie_is_secure_behind_https(client):
+    plain = client.post(
+        "/accounts",
+        json={"email": "plain-cookie@example.com", "password": "test-password-1"},
+    )
+    assert plain.status_code == 201, plain.text
+    plain_cookie = plain.headers["set-cookie"].lower()
+    assert "httponly" in plain_cookie
+    assert "samesite=lax" in plain_cookie
+    assert "secure" not in plain_cookie
+    proxied = client.post(
+        "/accounts",
+        json={"email": "proxied-cookie@example.com", "password": "test-password-1"},
+        headers={"x-forwarded-proto": "https"},
+    )
+    assert proxied.status_code == 201, proxied.text
+    proxied_cookie = proxied.headers["set-cookie"].lower()
+    assert "secure" in proxied_cookie
+    assert "httponly" in proxied_cookie
+    assert "samesite=lax" in proxied_cookie
+
+
+def test_a_sitting_stays_on_the_account_that_opened_it(client):
+    from fastapi.testclient import TestClient
+
+    from conftest import start_session
+
+    session_id, headers = start_session(client)
+    stranger = TestClient(client.app)
+    created = stranger.post(
+        "/accounts",
+        json={"email": "stranger@example.com", "password": "test-password-1"},
+    )
+    assert created.status_code == 201, created.text
+    denied = stranger.get(f"/sessions/{session_id}/interview", headers=headers)
+    assert denied.status_code == 403
+    bare = TestClient(client.app)
+    missing = bare.get(f"/sessions/{session_id}/interview", headers=headers)
+    assert missing.status_code == 401
+    allowed = client.get(f"/sessions/{session_id}/interview", headers=headers)
+    assert allowed.status_code == 200
+
+
 def test_dev_sample_stops_before_the_list(client, fake_qloo):
     response = client.post("/dev/sample")
     assert response.status_code == 201, response.text
@@ -192,3 +289,27 @@ def test_dev_sample_stops_before_the_list(client, fake_qloo):
     blocked = client.post(f"/sessions/{body['session_id']}/candidates", headers=headers)
     assert blocked.status_code == 409
     assert not any(call[0] == "insights" for call in fake_qloo.calls)
+
+
+def test_persona_summary_from_sample_answers():
+    built = materialize(_short_answers())
+    portrait = persona_summary(
+        interests=built["interests"],
+        habits=built["habits"],
+        anecdote=built["anecdote"],
+        exclusions=built["exclusions"],
+        caregiver_label="Ada",
+    )
+    text = portrait["persona_summary"]
+    assert "gardening" in text or "jazz" in text or "Nat King Cole" in text
+    assert "war documentaries" in text
+    assert "Sunday" in text
+    assert "therapy" not in text.casefold()
+    assert "photo" not in text.casefold() or "never" in portrait["qloo_plain"].casefold()
+    assert portrait["facets"]["interests"]
+    assert "music" in portrait["qloo_plain"].casefold()
+
+
+def test_persona_summary_does_not_invent_from_empty():
+    portrait = persona_summary(interests=[], habits=[], anecdote="", exclusions=[])
+    assert "still need" in portrait["persona_summary"].casefold()

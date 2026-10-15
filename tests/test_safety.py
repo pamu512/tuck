@@ -142,6 +142,24 @@ def test_candidates_seal_the_session_and_clear_family_text(client):
     assert preview.status_code == 409
 
 
+def test_qloo_auth_failure_does_not_name_the_key_file(client, fake_qloo):
+    from app.qloo import QlooAuthError
+
+    def boom(*_args, **_kwargs):
+        raise QlooAuthError(
+            "QLOO_API_KEY is not set. Export it or place it in /Users/secret/qloo-hackathon.env"
+        )
+
+    fake_qloo.search_tags = boom
+    session_id, headers = start_session(client)
+    acknowledge(client, session_id, headers, [])
+    response = client.post(f"/sessions/{session_id}/preview", headers=headers)
+    assert response.status_code == 503
+    assert "QLOO_API_KEY" not in response.text
+    assert "qloo-hackathon" not in response.text
+    assert "recommendation service" in response.text
+
+
 def test_all_insight_types_failing_keeps_the_session(client, fake_qloo):
     from app.qloo import QlooUpstreamError
 
@@ -154,6 +172,8 @@ def test_all_insight_types_failing_keeps_the_session(client, fake_qloo):
     run_to_preview(client, session_id, headers)
     response = client.post(f"/sessions/{session_id}/candidates", headers=headers)
     assert response.status_code == 502
+    assert "simulated" not in response.text
+    assert "preview is still here" in response.text
     assert client.app.state.store.get(session_id) is not None
 
 

@@ -118,6 +118,8 @@ def test_m3u_keeps_music_and_drops_excluded_film(client):
     assert plan["spotify_configured"] is False
     assert plan["playlist"] is None
     assert plan["description"] == "Shared listening for Test caregiver."
+    assert plan["exclusions"] == ["war documentaries"]
+    assert 'filename="tuck-listening.m3u"' in response.headers["content-disposition"]
     assert "Cochrane" not in plan["description"]
     assert "therapy" not in plan["description"].lower()
     names = [track["artist"] for track in plan["tracks"]]
@@ -263,6 +265,7 @@ def test_spotify_callback_creates_a_private_playlist_without_excluded_tracks(tmp
     assert "spot-access-token" not in callback.headers["location"]
     assert "auth-code" not in callback.headers["location"]
     assert seen["create"]["public"] is False
+    assert seen["create"]["name"].startswith("Tuck:")
     assert seen["create"]["description"] == "Shared listening for Test caregiver."
     assert "Sunday" not in seen["create"]["description"]
     assert "church" not in seen["create"]["description"].lower()
@@ -316,3 +319,72 @@ def test_spotify_callback_redirects_when_the_list_is_not_ready(tmp_path, fake_ql
     assert "auth-code" not in response.headers["location"]
     assert calls["n"] == 0
     assert client.app.state.store.get(session_id)["spotify_oauth"] is None
+
+
+def test_a_failed_track_add_discards_the_empty_playlist(tmp_path, fake_qloo):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/token":
+            return httpx.Response(200, json={"access_token": "spot-access-token"})
+        if request.url.path == "/v1/search":
+            return httpx.Response(
+                200,
+                json={
+                    "tracks": {
+                        "items": [
+                            {
+                                "id": "good",
+                                "uri": "spotify:track:good",
+                                "name": "So What",
+                                "artists": [{"name": "Miles Davis"}],
+                                "album": {"name": "Kind of Blue"},
+                            }
+                        ]
+                    }
+                },
+            )
+        if request.url.path == "/v1/me/playlists" and request.method == "POST":
+            return httpx.Response(
+                201,
+                json={
+                    "id": "pl-empty",
+                    "public": False,
+                    "name": "Tuck: Test caregiver",
+                    "external_urls": {"spotify": "https://open.spotify.com/playlist/pl-empty"},
+                },
+            )
+        if request.url.path == "/v1/playlists/pl-empty/items":
+            return httpx.Response(500, json={"error": {"message": "unavailable"}})
+        if request.method == "DELETE" and request.url.path == "/v1/playlists/pl-empty/followers":
+            seen["discarded"] = True
+            return httpx.Response(200, json={})
+        return httpx.Response(404, json={"error": "missing"})
+
+    def factory(redirect_uri: str) -> SpotifyAPI:
+        return SpotifyAPI("test-client", redirect_uri, transport=httpx.MockTransport(handler))
+
+    client = TestClient(
+        create_app(
+            store_path=tmp_path / "store.json",
+            qloo=fake_qloo,
+            spotify_client_id="test-client",
+            spotify_factory=factory,
+        )
+    )
+    session_id, headers = start_session(client)
+    _reach_export(client, headers, session_id, [])
+    start = client.post(f"/sessions/{session_id}/spotify/start", headers=headers)
+    assert start.status_code == 200, start.text
+    state = client.app.state.store.get(session_id)["spotify_oauth"]["state"]
+    callback = client.get(
+        "/spotify/callback",
+        params={"code": "auth-code", "state": state},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    assert "playlist=error" in callback.headers["location"]
+    assert "code=upstream" in callback.headers["location"]
+    assert "spot-access-token" not in callback.headers["location"]
+    assert seen.get("discarded") is True
+    assert client.app.state.store.get(session_id).get("playlist") is None

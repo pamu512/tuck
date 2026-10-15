@@ -235,6 +235,78 @@ def materialize(answers: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def persona_summary(
+    *,
+    interests: list[str] | None = None,
+    habits: list[dict[str, str]] | list[str] | None = None,
+    anecdote: str | None = None,
+    exclusions: list[str] | None = None,
+    caregiver_label: str | None = None,
+) -> dict[str, Any]:
+    """Warm first-person portrait grounded only in stated answers.
+
+    Synthesis and rephrase are allowed. Invented biography is not.
+    """
+    names = [str(item).strip() for item in (interests or []) if str(item).strip()]
+    habit_bits: list[str] = []
+    for item in habits or []:
+        if isinstance(item, dict):
+            bit = str(item.get("text") or "").strip()
+        else:
+            bit = str(item).strip()
+        if bit and bit.casefold() not in NONE_WORDS:
+            habit_bits.append(bit)
+    left_out = [str(item).strip() for item in (exclusions or []) if str(item).strip()]
+    moment = " ".join(str(anecdote or "").split()).strip()
+    who = (caregiver_label or "them").strip() or "them"
+
+    if not names and not habit_bits and not moment:
+        portrait = (
+            f"I still need a few words about {who} before I can sketch who this "
+            "listening is for."
+        )
+    else:
+        parts: list[str] = []
+        if names:
+            if len(names) == 1:
+                parts.append(f"From what you told me, this sitting leans toward {names[0]}.")
+            elif len(names) == 2:
+                parts.append(
+                    f"From what you told me, this sitting leans toward {names[0]} and {names[1]}."
+                )
+            else:
+                head = ", ".join(names[:-1])
+                parts.append(
+                    f"From what you told me, this sitting leans toward {head}, and {names[-1]}."
+                )
+        if habit_bits:
+            parts.append("How they like to be with it: " + "; ".join(habit_bits[:3]) + ".")
+        if moment:
+            clipped = moment if len(moment) <= 160 else moment[:157].rstrip() + "..."
+            parts.append(f"One ordinary moment you named: {clipped.rstrip(chr(46))}.")
+        if left_out:
+            parts.append("We will keep out: " + ", ".join(left_out[:6]) + ".")
+        else:
+            parts.append("You did not name anything that must stay out.")
+        portrait = " ".join(parts)
+
+    ask_plain = (
+        "Next I would ask for music, film, and place ideas that sit near what you "
+        "named. I only send the matched names, never the photo and never the story text."
+    )
+    return {
+        "persona_summary": portrait,
+        "facets": {
+            "interests": names[:8],
+            "habits": habit_bits[:6],
+            "anecdote": moment,
+            "exclusions": left_out[:12],
+            "caregiver_label": who,
+        },
+        "qloo_plain": ask_plain,
+    }
+
+
 def pending_feedback(saved: dict[str, Any] | None) -> dict[str, str] | None:
     data = saved or {}
     for item in FEEDBACK:

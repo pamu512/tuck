@@ -149,33 +149,45 @@ def verify_password(password: str, stored: dict[str, Any] | None) -> bool:
     return hmac.compare_digest(digest.hex(), expected)
 
 
-def issue_cookie(account_id: str, secret: str, *, now: float | None = None) -> str:
+def issue_cookie(
+    account_id: str,
+    secret: str,
+    version: int = 0,
+    *,
+    now: float | None = None,
+) -> str:
     exp = int((now if now is not None else time.time()) + COOKIE_MAX_AGE)
-    body = f"{account_id}.{exp}"
+    body = f"{account_id}.{exp}.{int(version)}"
     sig = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{body}.{sig}"
 
 
-def read_cookie(value: str | None, secret: str, *, now: float | None = None) -> str | None:
+def read_cookie(
+    value: str | None,
+    secret: str,
+    *,
+    now: float | None = None,
+) -> tuple[str, int] | None:
     if not value or not secret:
         return None
     parts = value.split(".")
-    if len(parts) != 3:
+    if len(parts) != 4:
         return None
-    account_id, exp, sig = parts
-    if not account_id or not exp or not sig:
+    account_id, exp, version, sig = parts
+    if not account_id or not exp or version == "" or not sig:
         return None
-    body = f"{account_id}.{exp}"
+    body = f"{account_id}.{exp}.{version}"
     expected = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, sig):
         return None
     try:
         expires = int(exp)
+        current_version = int(version)
     except ValueError:
         return None
-    if expires < int(now if now is not None else time.time()):
+    if current_version < 0 or expires < int(now if now is not None else time.time()):
         return None
-    return account_id
+    return account_id, current_version
 
 
 def fresh_profile() -> dict[str, Any]:
@@ -190,6 +202,7 @@ def new_account(email: str, password: str) -> dict[str, Any]:
         "email": email,
         "password": hash_password(password),
         "created_at": now_utc(),
+        "session_version": 0,
         "profile": fresh_profile(),
     }
 

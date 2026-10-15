@@ -64,7 +64,7 @@ def _one_line(label: str) -> str:
 
 
 def playlist_name(label: str) -> str:
-    return f"Guided Memory Lane: {_one_line(label)}"[:100]
+    return f"Tuck: {_one_line(label)}"[:100]
 
 
 def playlist_description(label: str) -> str:
@@ -369,6 +369,14 @@ class SpotifyAPI:
                 "Content-Type": "application/json",
             },
             json={"uris": uris},
+        )
+        self._raise(response, token, playlist_id)
+
+    def discard_playlist(self, token: str, playlist_id: str) -> None:
+        """Unfollow a playlist we created but could not fill. Owner unfollow deletes it."""
+        response = self._http.delete(
+            f"{SPOTIFY_API}/v1/playlists/{playlist_id}/followers",
+            headers={"Authorization": f"Bearer {token}"},
         )
         self._raise(response, token, playlist_id)
 

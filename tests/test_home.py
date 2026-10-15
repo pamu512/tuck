@@ -41,6 +41,11 @@ def test_static_guide_assets(client):
     assert "aria-busy" in js.text
     assert "sessionStorage" in js.text
     assert "textContent" in js.text
+    assert "plan.exclusions" in js.text
+    assert "if (listening) return;" in js.text
+    assert 'indexOf("Sign in")' in js.text
+    boot = js.text.split("async function boot()", 1)[1]
+    assert boot.index("resume()") < boot.index("playlistNotice()")
     # The invite token is kept in session storage, not written into the page.
     assert "invite-token" not in client.get("/").text
 

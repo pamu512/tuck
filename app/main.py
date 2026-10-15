@@ -88,6 +88,7 @@ from .playlist import (
     uris_to_add,
 )
 from .interview import (
+    persona_summary,
     NO_PHOTO,
     can_exit,
     fresh_interview,
@@ -104,10 +105,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 APP_DESCRIPTION = (
-    "Invite-first shared listening and looking sessions for families living "
-    "with dementia. Photos are never analyzed, anecdotes never leave the "
-    "family record, and Qloo cultural-affinity candidates are requested only "
-    "after trauma exclusions and a caregiver preview."
+    "Tuck asks one question at a time. An account is required before a sitting. "
+    "Photos are never analyzed, anecdotes never leave the family record, and "
+    "Qloo candidates are requested only after exclusions and a preview."
 )
 
 _EXCLUSION_NOTE = (
@@ -125,6 +125,18 @@ _COOKIE_INVITE = "gml_invite"
 def default_store_path() -> Path:
     env_path = os.environ.get("GML_STORE_PATH")
     return Path(env_path) if env_path else REPO_ROOT / "data" / "store.json"
+
+
+def request_is_https(request: Request) -> bool:
+    """True when the browser is on https, including Render's forwarded proto.
+
+    A client can only upgrade the flag. An http forward does not downgrade
+    an https URL.
+    """
+    forwarded = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    if forwarded == "https":
+        return True
+    return request.url.scheme == "https"
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -215,7 +227,7 @@ def create_app(
             qloo_client = QlooClient()
         return qloo_client
 
-    def load_session(session_id: str, token: str | None) -> dict[str, Any]:
+    def load_session(session_id: str, token: str | None, request: Request) -> dict[str, Any]:
         session = store.get(session_id)
         if session is None or domain.session_expired(session, ttl):
             if session is not None:
@@ -226,29 +238,49 @@ def create_app(
                 status_code=401,
                 detail="invalid or missing invite token (X-Invite-Token header)",
             )
+        owner = session.get("account_id")
+        if owner:
+            account = require_account(request)
+            if account["id"] != owner:
+                raise HTTPException(
+                    status_code=403,
+                    detail="That sitting belongs to another account.",
+                )
         return session
 
     def require_account(request: Request) -> dict[str, Any]:
         if not app.state.session_secret:
             raise HTTPException(status_code=503, detail="Sign-in is not configured on this server.")
-        account_id = read_cookie(request.cookies.get(ACCOUNT_COOKIE), app.state.session_secret)
-        if not account_id:
+        parsed = read_cookie(request.cookies.get(ACCOUNT_COOKIE), app.state.session_secret)
+        if not parsed:
             raise HTTPException(status_code=401, detail="Sign in before opening a session.")
+        account_id, version = parsed
         account = accounts.get(account_id)
         if account is None or "password" not in account:
             raise HTTPException(status_code=401, detail="Sign in before opening a session.")
+        if int(account.get("session_version") or 0) != version:
+            raise HTTPException(status_code=401, detail="Sign in before opening a session.")
         return account
 
-    def set_account_cookie(response: Response, request: Request, account_id: str) -> None:
+    def set_account_cookie(response: Response, request: Request, account: dict[str, Any]) -> None:
         response.set_cookie(
             ACCOUNT_COOKIE,
-            issue_cookie(account_id, app.state.session_secret),
+            issue_cookie(
+                account["id"],
+                app.state.session_secret,
+                int(account.get("session_version") or 0),
+            ),
             httponly=True,
             samesite="lax",
-            secure=request.url.scheme == "https",
+            secure=request_is_https(request),
             path="/",
             max_age=14 * 24 * 60 * 60,
         )
+
+    def clear_named_cookie(response: Response, name: str) -> None:
+        # Two Set-Cookie headers: one Secure, one not. Browsers match both.
+        for secure in (False, True):
+            response.delete_cookie(name, path="/", secure=secure, samesite="lax", httponly=True)
 
     def find_account_by_email(email: str) -> dict[str, Any] | None:
         # ponytail: scans the account file. Ceiling: hundreds of accounts.
@@ -347,7 +379,10 @@ def create_app(
 
     def guarded_qloo_errors(exc: Exception) -> HTTPException:
         if isinstance(exc, QlooAuthError):
-            return HTTPException(status_code=503, detail=str(exc))
+            return HTTPException(
+                status_code=503,
+                detail="I can't reach the recommendation service right now.",
+            )
         if isinstance(exc, QlooUpstreamError):
             return HTTPException(status_code=502, detail=str(exc))
         return HTTPException(status_code=500, detail="unexpected Qloo client error")
@@ -381,6 +416,17 @@ def create_app(
             for candidate in payload.get("candidates") or []
             if candidate.get("name") and candidate.get("why")
         }
+        exclusion_labels: list[str] = []
+        seen_labels: set[str] = set()
+        for item in exclusions:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            key = label.casefold()
+            if not label or key in seen_labels:
+                continue
+            seen_labels.add(key)
+            exclusion_labels.append(label)
         for track in tracks:
             artist = str(track.get("artist") or "").casefold()
             if artist in why_by_name and not track.get("why"):
@@ -403,6 +449,7 @@ def create_app(
             "playlist": playlist,
             "tracks": tracks,
             "withheld": withheld,
+            "exclusions": exclusion_labels,
             "candidates": payload.get("candidates") or [],
             "removed_by_exclusions": payload.get("removed_by_exclusions") or [],
             "boundary": payload.get("boundary"),
@@ -410,11 +457,10 @@ def create_app(
         }
 
     def set_oauth_cookies(response: Response, request: Request, session_id: str, token: str) -> None:
-        secure = request.url.scheme == "https"
         common = {
             "httponly": True,
             "samesite": "lax",
-            "secure": secure,
+            "secure": request_is_https(request),
             "path": "/",
             "max_age": OAUTH_MAX_AGE_SECONDS,
         }
@@ -428,8 +474,8 @@ def create_app(
         response = RedirectResponse("/?" + urlencode(query), status_code=303)
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
-        response.delete_cookie(_COOKIE_SESSION, path="/")
-        response.delete_cookie(_COOKIE_INVITE, path="/")
+        clear_named_cookie(response, _COOKIE_SESSION)
+        clear_named_cookie(response, _COOKIE_INVITE)
         return response
 
     @app.middleware("http")
@@ -487,7 +533,7 @@ def create_app(
             accounts.put(account)
         clear_failures(body.email)
         response = JSONResponse(public_account(account), status_code=201)
-        set_account_cookie(response, request, account["id"])
+        set_account_cookie(response, request, account)
         return response
 
     @app.post("/login")
@@ -505,13 +551,22 @@ def create_app(
             raise HTTPException(status_code=401, detail="That email or password does not match.")
         clear_failures(body.email)
         response = JSONResponse(public_account(account))
-        set_account_cookie(response, request, account["id"])
+        set_account_cookie(response, request, account)
         return response
 
     @app.post("/logout")
-    def logout() -> JSONResponse:
+    def logout(request: Request) -> JSONResponse:
+        if app.state.session_secret:
+            parsed = read_cookie(request.cookies.get(ACCOUNT_COOKIE), app.state.session_secret)
+            if parsed:
+                account_id, version = parsed
+                with accounts.session_scope(account_id):
+                    current = accounts.get(account_id)
+                    if current and int(current.get("session_version") or 0) == version:
+                        current["session_version"] = version + 1
+                        accounts.put(current)
         response = JSONResponse({"signed_out": True})
-        response.delete_cookie(ACCOUNT_COOKIE, path="/")
+        clear_named_cookie(response, ACCOUNT_COOKIE)
         return response
 
     @app.get("/me")
@@ -601,20 +656,22 @@ def create_app(
     @app.get("/sessions/{session_id}/interview")
     def get_interview(
         session_id: str,
+        request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, request)
             return interview_view(session)
 
     @app.post("/sessions/{session_id}/interview")
     def post_interview(
         session_id: str,
         turn: InterviewTurn,
+        request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, request)
             try:
                 domain.require_open(session)
             except domain.SessionError as exc:
@@ -665,15 +722,21 @@ def create_app(
     def post_feedback(
         session_id: str,
         turn: FeedbackTurn,
+        request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, request)
             if not session.get("sealed"):
                 raise HTTPException(status_code=409, detail="The list comes first.")
             text = " ".join(turn.text.split())
             if not text:
                 raise HTTPException(status_code=422, detail="Say it in a few words.")
+            waiting = pending_feedback(session.get("feedback"))
+            if waiting is None:
+                raise HTTPException(status_code=409, detail="Those notes are already saved.")
+            if turn.id != waiting["id"]:
+                raise HTTPException(status_code=409, detail="Answer the question I just asked.")
             saved = dict(session.get("feedback") or {})
             saved[turn.id] = text
             saved["at"] = domain.now_utc()
@@ -704,10 +767,11 @@ def create_app(
     def add_upload(
         session_id: str,
         request: domain.UploadRequest,
+        http_request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, http_request)
             try:
                 domain.require_open(session)
                 upload = domain.add_upload(session, request)
@@ -728,10 +792,11 @@ def create_app(
     def set_exclusions(
         session_id: str,
         request: domain.ExclusionsRequest,
+        http_request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, http_request)
             try:
                 domain.require_open(session)
             except domain.SessionError as exc:
@@ -751,13 +816,18 @@ def create_app(
                 body["resolution_warning"] = warning
             return body
 
+
+    def collect_interests_fallback(session: dict[str, Any]) -> list[str]:
+        return list(domain.collect_interests(session))
+
     @app.post("/sessions/{session_id}/preview")
     def preview(
         session_id: str,
+        request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, request)
             try:
                 domain.require_open(session)
                 signals, unresolved, trace = prepare_preview(session, get_qloo())
@@ -771,8 +841,26 @@ def create_app(
             session["agent_trace"] = trace
             session["previewed_at"] = domain.now_utc()
             store.put(session)
+            interview = session.get("interview") or {}
+            built = materialize(dict(interview.get("answers") or {}))
+            persona = persona_summary(
+                interests=built.get("interests") or collect_interests_fallback(session),
+                habits=built.get("habits") or [],
+                anecdote=built.get("anecdote")
+                or next((u.get("anecdote") for u in session.get("uploads") or [] if u.get("anecdote")), ""),
+                exclusions=[
+                    str(item.get("label") or "")
+                    for item in (session.get("exclusions") or [])
+                    if isinstance(item, dict) and item.get("label")
+                ],
+                caregiver_label=session.get("caregiver_label") or "",
+            )
             body = domain.preview_payload(
-                session, kept_signals=kept, withheld=withheld, unresolved=unresolved
+                session,
+                kept_signals=kept,
+                withheld=withheld,
+                unresolved=unresolved,
+                persona=persona,
             )
             body["guide"] = guide_status(session)
             body["guide"]["tools"] = trace["tools"]
@@ -783,10 +871,11 @@ def create_app(
     def guide(
         session_id: str,
         request: GuideRequest,
+        http_request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, http_request)
             view = guide_status(session)
             if request.intent == "status":
                 return view
@@ -805,10 +894,11 @@ def create_app(
     @app.post("/sessions/{session_id}/candidates")
     def candidates(
         session_id: str,
+        request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, request)
             if session.get("sealed"):
                 payload = (session.get("export") or {}).get("payload")
                 if not isinstance(payload, dict):
@@ -867,7 +957,7 @@ def create_app(
             if not collected and types_failed:
                 raise HTTPException(
                     status_code=502,
-                    detail=f"all insight categories failed: {types_failed}",
+                    detail="I could not finish the list. The preview is still here. Try again in a little while.",
                 )
             kept, removed = domain.filter_candidates(collected, session["exclusions"] or [])
             for candidate in kept:
@@ -881,26 +971,28 @@ def create_app(
     @app.get("/sessions/{session_id}/export")
     def export_session(
         session_id: str,
+        request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, request)
             return export_body(session)
 
     @app.get("/sessions/{session_id}/playlist.m3u")
     def playlist_m3u(
         session_id: str,
+        request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> Response:
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, request)
             body = export_body(session)
             m3u = render_m3u(body["name"], body["tracks"])
         return Response(
             content=m3u,
             media_type="audio/x-mpegurl",
             headers={
-                "Content-Disposition": 'attachment; filename="guided-memory-lane.m3u"',
+                "Content-Disposition": 'attachment; filename="tuck-listening.m3u"',
                 "Cache-Control": "no-store",
             },
         )
@@ -913,7 +1005,7 @@ def create_app(
     ) -> JSONResponse:
         redirect_uri = spotify_redirect(request)
         with store.session_scope(session_id):
-            session = load_session(session_id, x_invite_token)
+            session = load_session(session_id, x_invite_token, request)
             require_music_export(session)
             client_id = resolved_spotify_id()
             api = make_spotify(redirect_uri)
@@ -965,9 +1057,14 @@ def create_app(
         job: dict[str, Any] | None = None
         with store.session_scope(session_id):
             try:
-                session = load_session(session_id, token)
+                session = load_session(session_id, token, request)
             except HTTPException as exc:
-                flag = "session" if exc.status_code == 404 else "invite"
+                if exc.status_code == 404:
+                    flag = "session"
+                elif exc.status_code in (401, 403):
+                    flag = "cookie"
+                else:
+                    flag = "invite"
                 return playlist_redirect("error", flag)
             oauth = session.get("spotify_oauth") or {}
             if not oauth or oauth.get("state") != state:
@@ -997,6 +1094,10 @@ def create_app(
         api = make_spotify(job["redirect_uri"])
         if api is None:
             return playlist_redirect("error", "upstream")
+        created: dict[str, Any] | None = None
+        access_token = ""
+        tracks: list[dict[str, Any]] = []
+        withheld: list[dict[str, Any]] = []
         try:
             access_token = api.exchange_code(code, job["verifier"])
 
@@ -1020,15 +1121,27 @@ def create_app(
             )
             api.add_tracks(access_token, created["id"], uris)
         except (SpotifyError, httpx.HTTPError):
+            if created is not None and access_token:
+                try:
+                    api.discard_playlist(access_token, str(created["id"]))
+                except (SpotifyError, httpx.HTTPError):
+                    pass
             return playlist_redirect("error", "upstream")
         finally:
             api.close()
 
+        if created is None:
+            return playlist_redirect("error", "upstream")
         with store.session_scope(session_id):
             try:
-                session = load_session(session_id, token)
+                session = load_session(session_id, token, request)
             except HTTPException as exc:
-                flag = "session" if exc.status_code == 404 else "invite"
+                if exc.status_code == 404:
+                    flag = "session"
+                elif exc.status_code in (401, 403):
+                    flag = "cookie"
+                else:
+                    flag = "invite"
                 return playlist_redirect("error", flag)
             session["playlist"] = {
                 "id": created["id"],
@@ -1044,10 +1157,11 @@ def create_app(
     @app.delete("/sessions/{session_id}", status_code=204)
     def delete_session(
         session_id: str,
+        request: Request,
         x_invite_token: str | None = Header(default=None),
     ) -> Response:
         with store.session_scope(session_id):
-            load_session(session_id, x_invite_token)
+            load_session(session_id, x_invite_token, request)
             store.delete(session_id)
         return Response(status_code=204)
 

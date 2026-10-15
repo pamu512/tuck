@@ -60,6 +60,10 @@ function setBusy(busy) {
   desk.setAttribute("aria-busy", busy ? "true" : "false");
   document.querySelectorAll("button, input, textarea").forEach((node) => {
     if (node.id === "sign-out") return;
+    if (node.id === "ask-for-list-in-sheet" && node.dataset.blocked === "1") {
+      node.disabled = true;
+      return;
+    }
     node.disabled = busy;
   });
 }
@@ -75,10 +79,15 @@ function messageFrom(data, status) {
   return `The server returned ${status}.`;
 }
 
-async function api(path, { method = "GET", body = null, token = null } = {}) {
+async function api(path, { method = "GET", body = null, token = null, timeoutMs = 0 } = {}) {
   const headers = { Accept: "application/json" };
   if (body !== null) headers["Content-Type"] = "application/json";
   if (token) headers["X-Invite-Token"] = token;
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  let timer = null;
+  if (controller) {
+    timer = setTimeout(() => controller.abort(), timeoutMs);
+  }
   let response;
   try {
     response = await fetch(path, {
@@ -86,9 +95,15 @@ async function api(path, { method = "GET", body = null, token = null } = {}) {
       headers,
       body: body !== null ? JSON.stringify(body) : undefined,
       credentials: "same-origin",
+      signal: controller ? controller.signal : undefined,
     });
-  } catch (_err) {
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error("That took too long. Nothing was sealed. Try Ask for the list again.");
+    }
     throw new Error("The server did not respond. Check the connection and try again.");
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   const text = await response.text();
   let data = null;
@@ -183,23 +198,59 @@ async function showInterview() {
     return;
   }
   if (view.phase === "list") {
-    showAsk(view.asked, forms.listActions);
+    await showPreview({ resume: true, asked: view.asked });
     return;
   }
   await showGift();
 }
 
-async function showPreview() {
-  setStatus("Building the preview.");
+async function showPreview(opts = {}) {
+  const resume = Boolean(opts.resume);
+  setStatus(resume ? "Opening the preview again." : "Building the preview.");
   const preview = await api(`/sessions/${state.sessionId}/preview`, {
     method: "POST",
     token: state.token,
   });
-  showAsk("Here is what I would ask for. Nothing has been requested yet.", forms.preview);
-  forms.listActions.hidden = false;
+  const askText =
+    opts.asked ||
+    "Here is what I would ask for. Nothing has been requested yet.";
+  showAsk(askText, forms.preview);
+  // Keep the standalone list-actions hidden; the primary Ask lives in the sheet.
+  forms.listActions.hidden = true;
   const sheet = forms.preview;
   sheet.replaceChildren();
   sleeve(sheet);
+
+  const signals = preview.signals || [];
+  const canAsk = signals.length > 0;
+
+  if (preview.persona_summary) {
+    add(sheet, "h2", "Who this listening is for");
+    add(sheet, "p", preview.persona_summary);
+  }
+  if (preview.qloo_plain) {
+    add(sheet, "h2", "What I would ask for");
+    add(sheet, "p", preview.qloo_plain);
+  }
+
+  const actions = add(sheet, "p", null, "actions");
+  const askBtn = document.createElement("button");
+  askBtn.type = "button";
+  askBtn.className = "primary";
+  askBtn.id = "ask-for-list-in-sheet";
+  askBtn.textContent = "Ask for the list";
+  if (!canAsk) askBtn.dataset.blocked = "1";
+  askBtn.disabled = !canAsk || state.busy;
+  askBtn.addEventListener("click", () => requestList());
+  actions.appendChild(askBtn);
+  if (!canAsk) {
+    add(
+      sheet,
+      "p",
+      "I could not match enough of what you named to ask for a list yet. Add a singer, a film, or another clear name, then show the preview again."
+    );
+  }
+
   const grid = add(sheet, "div", null, "boundary");
   const left = add(grid, "div");
   add(left, "h2", "I would start from");
@@ -213,6 +264,9 @@ async function showPreview() {
   if (unresolved.length) {
     add(left, "p", `I could not match: ${unresolved.join(", ")}. Those words stay out of the request.`);
   }
+  if (signals.length) {
+    add(left, "p", `Matched for the request: ${signals.map((s) => s.name).filter(Boolean).join(", ")}.`);
+  }
   const right = add(grid, "div");
   add(right, "h2", "Left out");
   const exclusions = preview.exclusions || [];
@@ -221,11 +275,54 @@ async function showPreview() {
     const list = add(right, "ul");
     exclusions.forEach((item) => add(list, "li", item.label));
   }
-  if (preview.disclaimer) add(sheet, "p", preview.disclaimer);
+  const details = document.createElement("details");
+  details.className = "tech";
+  const summary = document.createElement("summary");
+  summary.textContent = "Technical details";
+  details.appendChild(summary);
+  if (preview.disclaimer) add(details, "p", preview.disclaimer);
   if (preview.what_qloo_receives && preview.what_qloo_receives.note) {
-    add(sheet, "p", preview.what_qloo_receives.note);
+    add(details, "p", preview.what_qloo_receives.note);
   }
+  const ids = (preview.what_qloo_receives && preview.what_qloo_receives.signal_ids) || [];
+  if (ids.length) add(details, "p", `Signal ids: ${ids.join(", ")}.`);
+  sheet.appendChild(details);
   setStatus("");
+  askBtn.scrollIntoView({ behavior: "smooth", block: "center" });
+  askBtn.focus();
+}
+
+async function requestList() {
+  if (state.busy) return;
+  setBusy(true);
+  setError("");
+  setStatus("Asking for the list. This can take up to half a minute.");
+  const progress = window.setInterval(() => {
+    if (!state.busy) return;
+    if (statusEl.textContent.indexOf("still working") === -1) {
+      setStatus("Still working on the list. Stay on this page.");
+    }
+  }, 8000);
+  try {
+    await api(`/sessions/${state.sessionId}/candidates`, {
+      method: "POST",
+      token: state.token,
+      timeoutMs: 25000,
+    });
+    setStatus("The list is ready. Opening the listening gift.");
+    await showGift();
+  } catch (err) {
+    setError(err.message || "I could not finish the list. The preview is still here.");
+    setStatus("");
+    const sheetBtn = document.getElementById("ask-for-list-in-sheet");
+    if (sheetBtn) {
+      sheetBtn.disabled = false;
+      sheetBtn.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  } finally {
+    window.clearInterval(progress);
+    setBusy(false);
+  }
 }
 
 function trackTitle(track) {
@@ -265,12 +362,12 @@ async function showGift() {
       }
     });
   }
-  const withheld = plan.withheld || [];
-  const removed = (plan.removed_by_exclusions || []).map((item) => item.name).filter(Boolean);
-  const leftOut = withheld.map((item) => item.matched_exclusion).filter(Boolean);
-  const uniqueLeft = [...new Set(leftOut)];
-  if (uniqueLeft.length) add(sheet, "p", `Left out: ${uniqueLeft.join(", ")}.`);
-  else if (!removed.length) add(sheet, "p", "You said nothing should be left out.");
+  const labels = [];
+  (plan.exclusions || []).forEach((label) => {
+    if (label && labels.indexOf(label) === -1) labels.push(label);
+  });
+  if (labels.length) add(sheet, "p", `Left out: ${labels.join(", ")}.`);
+  else add(sheet, "p", "You said nothing should be left out.");
   if (plan.boundary) add(sheet, "p", plan.boundary);
   const actions = forms.giftActions;
   actions.replaceChildren();
@@ -362,20 +459,28 @@ function setupMic() {
     return;
   }
   mic.hidden = false;
+  let listening = null;
   mic.addEventListener("click", () => {
+    if (listening) return;
     const field = document.getElementById("answer");
     const rec = new Speech();
+    listening = rec;
     rec.lang = document.documentElement.lang || "en-US";
     rec.onresult = (event) => {
-      const said = event.results[0][0].transcript;
-      field.value = field.value ? `${field.value.trim()} ${said}` : said;
+      const heard = event.results && event.results[0] && event.results[0][0];
+      if (!heard || !heard.transcript) return;
+      field.value = field.value ? `${field.value.trim()} ${heard.transcript}` : heard.transcript;
       field.focus();
     };
     rec.onerror = () => setError("The microphone did not catch that. You can type it.");
+    rec.onend = () => {
+      if (listening === rec) listening = null;
+    };
     try {
       rec.start();
       setStatus("Listening. You can edit the words before you send.");
     } catch (_err) {
+      listening = null;
       setError("The microphone did not start. You can type it.");
     }
   });
@@ -522,21 +627,8 @@ document.getElementById("build-preview").addEventListener("click", async () => {
   }
 });
 
-document.getElementById("request-list").addEventListener("click", async () => {
-  setBusy(true);
-  setStatus("Asking for the list.");
-  try {
-    await api(`/sessions/${state.sessionId}/candidates`, {
-      method: "POST",
-      token: state.token,
-    });
-    await showGift();
-  } catch (err) {
-    setError(err.message);
-    setStatus("");
-  } finally {
-    setBusy(false);
-  }
+document.getElementById("request-list").addEventListener("click", () => {
+  requestList();
 });
 
 forms.feedback.addEventListener("submit", async (event) => {
@@ -570,16 +662,6 @@ forms.feedback.addEventListener("submit", async (event) => {
     setBusy(false);
   }
 });
-
-async function askFeedback(id, ask) {
-  state.feedbackId = id;
-  const giftWas = !forms.gift.hidden;
-  showAsk(ask, forms.feedback);
-  if (giftWas) {
-    forms.gift.hidden = false;
-    forms.giftActions.hidden = false;
-  }
-}
 
 signOut.addEventListener("click", async () => {
   setBusy(true);
@@ -643,20 +725,21 @@ async function resume() {
 async function boot() {
   setBusy(true);
   setStatus("One moment.");
-  playlistNotice();
   try {
     const account = await api("/me");
     signOut.hidden = false;
     const resumed = await resume();
     if (!resumed) await land(account);
-    setStatus(statusEl.textContent === "One moment." ? "" : statusEl.textContent);
   } catch (err) {
-    if (err.message && err.message.indexOf("not configured") !== -1) {
-      setError(err.message);
+    const message = err.message || "";
+    if (message.indexOf("Sign in") !== -1 || message.indexOf("not configured") !== -1) {
+      clearSession();
     }
+    if (message.indexOf("not configured") !== -1) setError(message);
     showAsk("What email should I use for your account?", forms.email);
-    setStatus("");
   } finally {
+    playlistNotice();
+    if (statusEl.textContent === "One moment.") setStatus("");
     setBusy(false);
   }
 }
