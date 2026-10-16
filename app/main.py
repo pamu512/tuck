@@ -1094,15 +1094,50 @@ def create_app(
 
         if job is None:
             return playlist_redirect("error", "state")
-        api = make_spotify(job["redirect_uri"])
-        if api is None:
-            return playlist_redirect("error", "upstream")
+
+        def fail(err_code: str, detail: str) -> RedirectResponse:
+            """Log scrubbed detail, persist playlist_error, redirect.
+
+            Every Spotify-API failure path funnels through here so no branch
+            can redirect with an error code and leave nothing behind.
+            """
+            safe = detail
+            for secret in (access_token, code, str(job.get("verifier") or "")):
+                if secret:
+                    safe = safe.replace(secret, "[REDACTED]")
+            safe = safe[:180]
+            _spotify_log.warning(
+                "spotify callback failed session=%s err=%s detail=%s",
+                session_id,
+                err_code,
+                safe,
+            )
+            try:
+                with store.session_scope(session_id):
+                    session = store.get(session_id)
+                    if session is not None:
+                        session["playlist_error"] = {"code": err_code, "detail": safe}
+                        store.put(session)
+            except Exception:
+                pass
+            return playlist_redirect("error", err_code)
+
         created: dict[str, Any] | None = None
         access_token = ""
         tracks: list[dict[str, Any]] = []
         withheld: list[dict[str, Any]] = []
+        api = make_spotify(job["redirect_uri"])
+        if api is None:
+            return fail("upstream", "spotify client id missing at callback time")
         try:
             access_token = api.exchange_code(code, job["verifier"])
+        except SpotifyError as exc:
+            api.close()
+            return fail("token", str(exc))
+        except httpx.HTTPError as exc:
+            api.close()
+            return fail("upstream", f"{type(exc).__name__} during token exchange")
+        try:
 
             def search(artist: str) -> list[dict[str, Any]]:
                 return api.search_artist_tracks(access_token, artist)
@@ -1114,9 +1149,21 @@ def create_app(
             )
             uris = uris_to_add(tracks, job["exclusions"])
             if not uris:
-                if withheld and all(item.get("field") == "search" for item in withheld):
-                    return playlist_redirect("error", "upstream")
-                return playlist_redirect("error", "empty")
+                search_errors = [
+                    item
+                    for item in withheld
+                    if item.get("field") == "search" and item.get("reason") == "error"
+                ]
+                if search_errors:
+                    # Spotify rejected the artist lookups (dev-mode allowlist,
+                    # lapsed owner Premium, rate limit). Not a content outcome.
+                    artists = ", ".join(str(item.get("name") or "") for item in search_errors)
+                    first_detail = str(search_errors[0].get("detail") or "search failed")
+                    return fail(
+                        "search",
+                        f"artist lookup failed for {len(search_errors)}: [{artists}] {first_detail}",
+                    )
+                return fail("empty", "no music candidate resolved to a playable track")
             created = api.create_private_playlist(
                 access_token,
                 playlist_name(job["label"]),
@@ -1140,49 +1187,19 @@ def create_app(
                 if ("access token" in folded or "token response" in folded)
                 else "upstream"
             )
-            _spotify_log.warning(
-                "spotify callback failed session=%s err=%s detail=%s",
-                session_id,
-                err_code,
-                detail,
-            )
-            try:
-                with store.session_scope(session_id):
-                    session = store.get(session_id)
-                    if session is not None:
-                        session["playlist_error"] = {"code": err_code, "detail": detail}
-                        store.put(session)
-            except Exception:
-                pass
-            return playlist_redirect("error", err_code)
+            return fail(err_code, detail)
         except httpx.HTTPError as exc:
             if created is not None and access_token:
                 try:
                     api.discard_playlist(access_token, str(created["id"]))
                 except (SpotifyError, httpx.HTTPError):
                     pass
-            _spotify_log.warning(
-                "spotify callback http failed session=%s err=%s",
-                session_id,
-                type(exc).__name__,
-            )
-            try:
-                with store.session_scope(session_id):
-                    session = store.get(session_id)
-                    if session is not None:
-                        session["playlist_error"] = {
-                            "code": "upstream",
-                            "detail": type(exc).__name__,
-                        }
-                        store.put(session)
-            except Exception:
-                pass
-            return playlist_redirect("error", "upstream")
+            return fail("upstream", f"{type(exc).__name__} during spotify call")
         finally:
             api.close()
 
         if created is None:
-            return playlist_redirect("error", "upstream")
+            return fail("upstream", "playlist create produced no result")
         with store.session_scope(session_id):
             try:
                 session = load_session(session_id, token, request)

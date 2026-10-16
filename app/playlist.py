@@ -185,7 +185,12 @@ def assemble_tracks(
     exclusions: list[dict[str, Any]],
     search: SearchFn | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """Music candidates only. Artist exclusions skip the search entirely."""
+    """Music candidates only. Artist exclusions skip the search entirely.
+
+    A withheld field of "search" carries a reason: "error" when Spotify
+    rejected the lookup (detail holds the scrubbed message) or
+    "no-results" when Spotify answered with nothing usable.
+    """
     kept: list[dict[str, Any]] = []
     withheld: list[dict[str, str]] = []
     for candidate in candidates:
@@ -207,8 +212,16 @@ def assemble_tracks(
             continue
         try:
             found = search(name) or []
-        except SpotifyError:
-            withheld.append({"name": name, "matched_exclusion": "", "field": "search"})
+        except SpotifyError as exc:
+            withheld.append(
+                {
+                    "name": name,
+                    "matched_exclusion": "",
+                    "field": "search",
+                    "reason": "error",
+                    "detail": str(exc)[:180],
+                }
+            )
             continue
         chosen, skipped = choose_track(found, exclusions)
         if chosen is None:
@@ -221,7 +234,14 @@ def assemble_tracks(
                     }
                 )
             else:
-                withheld.append({"name": name, "matched_exclusion": "", "field": "search"})
+                withheld.append(
+                    {
+                        "name": name,
+                        "matched_exclusion": "",
+                        "field": "search",
+                        "reason": "no-results",
+                    }
+                )
             continue
         kept.append(_resolved_row(candidate, chosen))
     return kept, withheld
@@ -281,12 +301,14 @@ class SpotifyAPI:
             body = None
         if isinstance(body, dict):
             err = body.get("error")
+            description = body.get("error_description")
             if isinstance(err, dict):
                 detail = str(err.get("message") or err.get("status") or "")
             elif isinstance(err, str):
-                detail = err
-            elif body.get("error_description"):
-                detail = str(body.get("error_description"))
+                # OAuth token errors carry both a code and a description.
+                detail = f"{err}: {description}" if description else err
+            elif description:
+                detail = str(description)
         if not detail:
             detail = f"HTTP {response.status_code}"
         raise SpotifyError(

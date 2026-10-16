@@ -4,7 +4,9 @@ const PLAYLIST_ERRORS = {
   cookie: "The browser did not keep the sitting through Spotify. Start the playlist again from this page.",
   session: "This sitting is no longer on the server.",
   invite: "This sitting could not be opened again. Start once more.",
+  token: "Spotify did not accept the sign-in. Start the playlist step again.",
   upstream: "Spotify did not finish the playlist. The listening file is still here.",
+  search: "Spotify could not look up the artists, so no playlist was created. The search links are still here.",
   empty: "No track cleared what you left out, so no playlist was created. The search links are still here.",
   stale: "That Spotify step expired. Start it again.",
 };

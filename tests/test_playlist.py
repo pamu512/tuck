@@ -3,12 +3,19 @@
 import base64
 import hashlib
 import json
+import logging
 
 import httpx
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.playlist import SpotifyAPI, assemble_tracks, choose_track, pkce_pair
+from app.playlist import (
+    SpotifyAPI,
+    SpotifyError,
+    assemble_tracks,
+    choose_track,
+    pkce_pair,
+)
 from app.sample import SAMPLE
 from conftest import acknowledge, open_account, run_to_candidates, run_to_preview, start_session
 
@@ -458,3 +465,219 @@ def test_spotify_callback_accepts_create_response_without_public_field(tmp_path,
     stored = client.app.state.store.get(session_id)
     assert stored["playlist"]["id"] == "pl-nopublic"
     assert stored["playlist"]["public"] is False
+
+
+def test_assemble_tracks_distinguishes_search_errors_from_no_results():
+    candidates = [
+        {"type": "music", "name": "Miles Davis", "entity_id": "A-2"},
+        {"type": "music", "name": "Nat King Cole", "entity_id": "A-1"},
+    ]
+
+    def search(artist: str):
+        if artist == "Miles Davis":
+            raise SpotifyError("Spotify request failed: HTTP 403")
+        return []
+
+    kept, withheld = assemble_tracks(candidates, [], search=search)
+    assert kept == []
+    by_name = {item["name"]: item for item in withheld}
+    assert by_name["Miles Davis"]["field"] == "search"
+    assert by_name["Miles Davis"]["reason"] == "error"
+    assert "HTTP 403" in by_name["Miles Davis"]["detail"]
+    assert by_name["Nat King Cole"]["field"] == "search"
+    assert by_name["Nat King Cole"]["reason"] == "no-results"
+
+
+def test_assemble_tracks_keeps_resolved_artists_when_another_search_errors():
+    candidates = [
+        {"type": "music", "name": "Miles Davis", "entity_id": "A-2"},
+        {"type": "music", "name": "Nat King Cole", "entity_id": "A-1"},
+    ]
+
+    def search(artist: str):
+        if artist == "Miles Davis":
+            raise SpotifyError("Spotify request failed: HTTP 429")
+        return [
+            {
+                "uri": "spotify:track:good",
+                "title": "Unforgettable",
+                "album": "The Very Best",
+                "artists": ["Nat King Cole"],
+                "id": "good",
+            }
+        ]
+
+    kept, withheld = assemble_tracks(candidates, [], search=search)
+    assert [track["artist"] for track in kept] == ["Nat King Cole"]
+    assert [item["name"] for item in withheld] == ["Miles Davis"]
+    assert withheld[0]["reason"] == "error"
+
+
+def test_spotify_callback_reports_failed_searches_as_search_not_upstream(
+    tmp_path, fake_qloo, caplog
+):
+    """Every artist search failing is reported, logged, and persisted.
+
+    Regression for the silent live path: searches 403 per artist, each error
+    swallowed, and the callback redirected to code=upstream with no log line
+    and no playlist_error.
+    """
+    seen = {"create": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/token":
+            return httpx.Response(200, json={"access_token": "spot-access-token"})
+        if request.url.path == "/v1/search":
+            return httpx.Response(
+                403,
+                json={
+                    "error": {
+                        "message": "User not registered in the Developer Dashboard"
+                    }
+                },
+            )
+        if request.url.path == "/v1/me/playlists" and request.method == "POST":
+            seen["create"] += 1
+            return httpx.Response(500, json={"error": {"message": "must not happen"}})
+        return httpx.Response(404, json={"error": "missing"})
+
+    def factory(redirect_uri: str) -> SpotifyAPI:
+        return SpotifyAPI("test-client", redirect_uri, transport=httpx.MockTransport(handler))
+
+    caplog.set_level(logging.WARNING, logger="tuck.spotify")
+    client = TestClient(
+        create_app(
+            store_path=tmp_path / "store.json",
+            qloo=fake_qloo,
+            spotify_client_id="test-client",
+            spotify_factory=factory,
+        )
+    )
+    session_id, headers = start_session(client)
+    _reach_export(client, headers, session_id, [])
+    start = client.post(f"/sessions/{session_id}/spotify/start", headers=headers)
+    assert start.status_code == 200, start.text
+    state = client.app.state.store.get(session_id)["spotify_oauth"]["state"]
+    callback = client.get(
+        "/spotify/callback",
+        params={"code": "auth-code", "state": state},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    location = callback.headers["location"]
+    assert "code=search" in location
+    assert "code=upstream" not in location
+    assert "spot-access-token" not in location
+    assert "auth-code" not in location
+    assert seen["create"] == 0
+
+    stored = client.app.state.store.get(session_id)
+    error = stored.get("playlist_error") or {}
+    assert error.get("code") == "search"
+    assert "User not registered" in str(error.get("detail"))
+    assert "spot-access-token" not in json.dumps(stored)
+
+    warnings = [r for r in caplog.records if "spotify callback failed" in r.message]
+    assert warnings, "the all-searches-failed path must log a warning"
+    assert "err=search" in caplog.text
+    assert "User not registered" in caplog.text
+
+
+def test_spotify_callback_token_exchange_failure_is_token_code(tmp_path, fake_qloo, caplog):
+    """invalid_grant carries neither 'access token' nor 'token response', so
+    string matching used to mislabel a failed exchange as upstream."""
+    seen = {"search": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/token":
+            return httpx.Response(
+                400,
+                json={"error": "invalid_grant", "error_description": "Invalid code_verifier"},
+            )
+        if request.url.path == "/v1/search":
+            seen["search"] += 1
+            return httpx.Response(200, json={"tracks": {"items": []}})
+        return httpx.Response(404, json={"error": "missing"})
+
+    def factory(redirect_uri: str) -> SpotifyAPI:
+        return SpotifyAPI("test-client", redirect_uri, transport=httpx.MockTransport(handler))
+
+    caplog.set_level(logging.WARNING, logger="tuck.spotify")
+    client = TestClient(
+        create_app(
+            store_path=tmp_path / "store.json",
+            qloo=fake_qloo,
+            spotify_client_id="test-client",
+            spotify_factory=factory,
+        )
+    )
+    session_id, headers = start_session(client)
+    _reach_export(client, headers, session_id, [])
+    start = client.post(f"/sessions/{session_id}/spotify/start", headers=headers)
+    assert start.status_code == 200, start.text
+    state = client.app.state.store.get(session_id)["spotify_oauth"]["state"]
+    callback = client.get(
+        "/spotify/callback",
+        params={"code": "auth-code", "state": state},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    location = callback.headers["location"]
+    assert "code=token" in location
+    assert "code=upstream" not in location
+    assert "auth-code" not in location
+    assert seen["search"] == 0
+
+    stored = client.app.state.store.get(session_id)
+    error = stored.get("playlist_error") or {}
+    assert error.get("code") == "token"
+    assert "Invalid code_verifier" in str(error.get("detail"))
+    assert "auth-code" not in str(error.get("detail"))
+    assert "err=token" in caplog.text
+
+
+def test_spotify_callback_zero_results_is_empty_not_upstream(tmp_path, fake_qloo, caplog):
+    seen = {"create": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/token":
+            return httpx.Response(200, json={"access_token": "spot-access-token"})
+        if request.url.path == "/v1/search":
+            return httpx.Response(200, json={"tracks": {"items": []}})
+        if request.url.path == "/v1/me/playlists" and request.method == "POST":
+            seen["create"] += 1
+            return httpx.Response(500, json={"error": {"message": "must not happen"}})
+        return httpx.Response(404, json={"error": "missing"})
+
+    def factory(redirect_uri: str) -> SpotifyAPI:
+        return SpotifyAPI("test-client", redirect_uri, transport=httpx.MockTransport(handler))
+
+    caplog.set_level(logging.WARNING, logger="tuck.spotify")
+    client = TestClient(
+        create_app(
+            store_path=tmp_path / "store.json",
+            qloo=fake_qloo,
+            spotify_client_id="test-client",
+            spotify_factory=factory,
+        )
+    )
+    session_id, headers = start_session(client)
+    _reach_export(client, headers, session_id, [])
+    start = client.post(f"/sessions/{session_id}/spotify/start", headers=headers)
+    assert start.status_code == 200, start.text
+    state = client.app.state.store.get(session_id)["spotify_oauth"]["state"]
+    callback = client.get(
+        "/spotify/callback",
+        params={"code": "auth-code", "state": state},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    location = callback.headers["location"]
+    assert "code=empty" in location
+    assert "code=upstream" not in location
+    assert seen["create"] == 0
+
+    stored = client.app.state.store.get(session_id)
+    error = stored.get("playlist_error") or {}
+    assert error.get("code") == "empty"
+    assert [r for r in caplog.records if "spotify callback failed" in r.message]
