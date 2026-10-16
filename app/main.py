@@ -1138,9 +1138,10 @@ def create_app(
             api.close()
             return fail("upstream", f"{type(exc).__name__} during token exchange")
         try:
+            market = api.resolve_market(access_token)
 
             def search(artist: str) -> list[dict[str, Any]]:
-                return api.search_artist_tracks(access_token, artist)
+                return api.search_artist_tracks(access_token, artist, market=market)
 
             tracks, withheld = assemble_tracks(
                 job["candidates"],

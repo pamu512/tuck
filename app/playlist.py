@@ -8,6 +8,7 @@ The description names the family label and nothing else.
 from __future__ import annotations
 
 import base64
+import os
 import hashlib
 import secrets
 from datetime import datetime, timezone
@@ -283,10 +284,17 @@ class SpotifyAPI:
         redirect_uri: str,
         transport: httpx.BaseTransport | None = None,
         timeout: float = 30.0,
+        market: str | None = None,
     ) -> None:
         self.client_id = client_id.strip()
         self.redirect_uri = redirect_uri.strip()
         self._http = httpx.Client(timeout=timeout, transport=transport)
+        # After Feb 2026, User.country may be absent from /me. Search without a
+        # market (and without an account country) treats catalog as unavailable.
+        env_market = (os.environ.get("SPOTIFY_MARKET") or "").strip().upper()
+        chosen = (market or env_market or "US").strip().upper()
+        self.default_market = chosen[:2] if len(chosen) >= 2 else "US"
+        self._market: str | None = None
 
     def close(self) -> None:
         self._http.close()
@@ -337,13 +345,49 @@ class SpotifyAPI:
             raise SpotifyError("Spotify token response had no access token.")
         return token
 
-    def search_artist_tracks(self, token: str, artist: str, limit: int = 5) -> list[dict[str, Any]]:
+    def resolve_market(self, token: str) -> str:
+        """ISO market for search. Prefer /me country, else SPOTIFY_MARKET/US."""
+        if self._market:
+            return self._market
+        try:
+            response = self._http.get(
+                f"{SPOTIFY_API}/v1/me",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if response.status_code < 400:
+                country = (response.json() or {}).get("country")
+                if isinstance(country, str) and len(country.strip()) == 2:
+                    self._market = country.strip().upper()
+                    return self._market
+        except (httpx.HTTPError, ValueError, TypeError):
+            pass
+        self._market = self.default_market
+        return self._market
+
+    def search_artist_tracks(
+        self,
+        token: str,
+        artist: str,
+        limit: int = 5,
+        market: str | None = None,
+    ) -> list[dict[str, Any]]:
         # ponytail: first page only. If all `limit` hits are excluded, the artist
         # is withheld. Upgrade path: follow Spotify paging until one track clears.
         safe_artist = artist.replace('"', "").strip()
+        if limit < 1:
+            limit = 1
+        if limit > 10:
+            limit = 10
+        use_market = (market or self._market or self.default_market).strip().upper()[:2]
+        params: dict[str, str] = {
+            "q": f'artist:"{safe_artist}"',
+            "type": "track",
+            "limit": str(limit),
+            "market": use_market,
+        }
         response = self._http.get(
             f"{SPOTIFY_API}/v1/search",
-            params={"q": f'artist:"{safe_artist}"', "type": "track", "limit": str(limit)},
+            params=params,
             headers={"Authorization": f"Bearer {token}"},
         )
         self._raise(response, token)
@@ -355,6 +399,26 @@ class SpotifyAPI:
             normalized = _normalize_spotify_track(item)
             if normalized:
                 tracks.append(normalized)
+        # Broader query when the quoted artist filter returns nothing.
+        if not tracks and safe_artist:
+            response = self._http.get(
+                f"{SPOTIFY_API}/v1/search",
+                params={
+                    "q": safe_artist,
+                    "type": "track",
+                    "limit": str(limit),
+                    "market": use_market,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self._raise(response, token)
+            items = ((response.json() or {}).get("tracks") or {}).get("items") or []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                normalized = _normalize_spotify_track(item)
+                if normalized:
+                    tracks.append(normalized)
         return tracks
 
     def create_private_playlist(self, token: str, name: str, description: str) -> dict[str, Any]:

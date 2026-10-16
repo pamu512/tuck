@@ -681,3 +681,142 @@ def test_spotify_callback_zero_results_is_empty_not_upstream(tmp_path, fake_qloo
     error = stored.get("playlist_error") or {}
     assert error.get("code") == "empty"
     assert [r for r in caplog.records if "spotify callback failed" in r.message]
+
+
+def test_spotify_search_sends_explicit_market(tmp_path, fake_qloo):
+    """Without market, Spotify may treat catalog as unavailable (empty items)."""
+    seen = {"markets": [], "me": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/token":
+            return httpx.Response(200, json={"access_token": "spot-access-token"})
+        if request.url.path == "/v1/me":
+            seen["me"] += 1
+            return httpx.Response(200, json={"id": "user1", "country": "HK"})
+        if request.url.path == "/v1/search":
+            seen["markets"].append(request.url.params.get("market"))
+            return httpx.Response(
+                200,
+                json={
+                    "tracks": {
+                        "items": [
+                            {
+                                "id": "good",
+                                "uri": "spotify:track:good",
+                                "name": "So What",
+                                "artists": [{"name": "Miles Davis"}],
+                                "album": {"name": "Kind of Blue"},
+                            }
+                        ]
+                    }
+                },
+            )
+        if request.url.path == "/v1/me/playlists" and request.method == "POST":
+            return httpx.Response(
+                201,
+                json={
+                    "id": "pl-mkt",
+                    "public": False,
+                    "name": "Tuck",
+                    "external_urls": {"spotify": "https://open.spotify.com/playlist/pl-mkt"},
+                },
+            )
+        if request.url.path == "/v1/playlists/pl-mkt/items":
+            return httpx.Response(201, json={"snapshot_id": "snap"})
+        return httpx.Response(404, json={"error": "missing"})
+
+    def factory(redirect_uri: str) -> SpotifyAPI:
+        return SpotifyAPI("test-client", redirect_uri, transport=httpx.MockTransport(handler))
+
+    client = TestClient(
+        create_app(
+            store_path=tmp_path / "store.json",
+            qloo=fake_qloo,
+            spotify_client_id="test-client",
+            spotify_factory=factory,
+        )
+    )
+    session_id, headers = start_session(client)
+    _reach_export(client, headers, session_id, [])
+    start = client.post(f"/sessions/{session_id}/spotify/start", headers=headers)
+    assert start.status_code == 200, start.text
+    state = client.app.state.store.get(session_id)["spotify_oauth"]["state"]
+    callback = client.get(
+        "/spotify/callback",
+        params={"code": "auth-code", "state": state},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    assert "playlist=ready" in callback.headers["location"]
+    assert seen["me"] == 1
+    assert seen["markets"]
+    assert all(m == "HK" for m in seen["markets"])
+
+
+def test_spotify_search_falls_back_to_default_market_when_me_omits_country(tmp_path, fake_qloo, monkeypatch):
+    monkeypatch.setenv("SPOTIFY_MARKET", "GB")
+    seen = {"markets": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/token":
+            return httpx.Response(200, json={"access_token": "spot-access-token"})
+        if request.url.path == "/v1/me":
+            # Feb 2026 changelog removed User.country from /me responses.
+            return httpx.Response(200, json={"id": "user1", "display_name": "Caregiver"})
+        if request.url.path == "/v1/search":
+            seen["markets"].append(request.url.params.get("market"))
+            return httpx.Response(
+                200,
+                json={
+                    "tracks": {
+                        "items": [
+                            {
+                                "id": "good",
+                                "uri": "spotify:track:good",
+                                "name": "So What",
+                                "artists": [{"name": "Miles Davis"}],
+                                "album": {"name": "Kind of Blue"},
+                            }
+                        ]
+                    }
+                },
+            )
+        if request.url.path == "/v1/me/playlists" and request.method == "POST":
+            return httpx.Response(
+                201,
+                json={
+                    "id": "pl-gb",
+                    "public": False,
+                    "name": "Tuck",
+                    "external_urls": {"spotify": "https://open.spotify.com/playlist/pl-gb"},
+                },
+            )
+        if request.url.path == "/v1/playlists/pl-gb/items":
+            return httpx.Response(201, json={"snapshot_id": "snap"})
+        return httpx.Response(404, json={"error": "missing"})
+
+    def factory(redirect_uri: str) -> SpotifyAPI:
+        return SpotifyAPI("test-client", redirect_uri, transport=httpx.MockTransport(handler))
+
+    client = TestClient(
+        create_app(
+            store_path=tmp_path / "store.json",
+            qloo=fake_qloo,
+            spotify_client_id="test-client",
+            spotify_factory=factory,
+        )
+    )
+    session_id, headers = start_session(client)
+    _reach_export(client, headers, session_id, [])
+    start = client.post(f"/sessions/{session_id}/spotify/start", headers=headers)
+    assert start.status_code == 200, start.text
+    state = client.app.state.store.get(session_id)["spotify_oauth"]["state"]
+    callback = client.get(
+        "/spotify/callback",
+        params={"code": "auth-code", "state": state},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    assert "playlist=ready" in callback.headers["location"]
+    assert seen["markets"]
+    assert all(m == "GB" for m in seen["markets"])
