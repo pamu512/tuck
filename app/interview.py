@@ -9,7 +9,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .session import MAX_TOTAL_INTERESTS
+from .looking import photo_provided
+from .session import MAX_TOTAL_INTERESTS, UploadRequest, add_upload
 
 NONE_WORDS = frozenset({"none", "nothing", "no", "n/a", "na", "skip", "nothing else"})
 MIN_ANSWERS_BEFORE_EXIT = 8
@@ -177,6 +178,18 @@ def _phrases(text: str) -> list[str]:
     return kept
 
 
+def acknowledge(answer: str) -> str:
+    """One sentence in Tuck's voice. Quotes their words. Does not add a life story."""
+    text = " ".join(str(answer or "").split())
+    if not text:
+        return ""
+    if text.casefold() in NONE_WORDS:
+        return "I'll leave that as none."
+    if len(text) > 72:
+        return f'I\'ll keep "{text[:69].rstrip()}...".'
+    return f'I\'ll keep "{text}."'
+
+
 def validate_answer(probe: dict[str, Any], text: str) -> str:
     text = " ".join(text.split())
     if not text:
@@ -222,7 +235,7 @@ def soft_normalize_interest(phrase: str) -> str:
     return out
 
 
-def materialize(answers: dict[str, str]) -> dict[str, Any]:
+def materialize(answers: dict[str, str], photo_path: str | None = None) -> dict[str, Any]:
     """Turn stored answers into upload fields. Skipped and 'none' add nothing.
 
     Early hobby probes can emit many comma-separated phrases. Cap retention is
@@ -264,13 +277,39 @@ def materialize(answers: dict[str, str]) -> dict[str, Any]:
         room = MAX_TOTAL_INTERESTS - len(interests)
         interests.extend(other[:room])
     anecdote = (answers.get("moment") or "").strip()
+    chosen = str(photo_path or "").strip()
+    if not photo_provided(chosen):
+        chosen = NO_PHOTO
     return {
         "interests": interests,
         "exclusions": exclusions[:12],
         "habits": habits,
         "anecdote": anecdote,
-        "photo_path": NO_PHOTO,
+        "photo_path": chosen,
     }
+
+
+def apply_looking_photo(
+    session: dict[str, Any],
+    *,
+    href: str,
+    media_type: str,
+    anecdote: str,
+) -> None:
+    """Attach an opaque photo. Replace a not-provided placeholder when one exists."""
+    interview = session.setdefault("interview", fresh_interview())
+    interview["photo_path"] = href
+    interview["photo_type"] = media_type
+    if not interview.get("committed"):
+        return
+    for upload in session.get("uploads") or []:
+        path = str(upload.get("photo_path") or "")
+        if path.startswith("/data/") or not photo_provided(path):
+            upload["photo_path"] = href
+            upload["photo_type"] = media_type
+            upload["anecdote"] = anecdote
+            return
+    add_upload(session, UploadRequest(photo_path=href, anecdote=anecdote, interests=[]))
 
 
 def persona_summary(

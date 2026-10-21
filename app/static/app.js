@@ -62,12 +62,15 @@ function setBusy(busy) {
   desk.setAttribute("aria-busy", busy ? "true" : "false");
   document.querySelectorAll("button, input, textarea").forEach((node) => {
     if (node.id === "sign-out") return;
+    // Disabling a file input drops the chosen file in some browsers.
+    if (node.type === "file") return;
     if (node.id === "ask-for-list-in-sheet" && node.dataset.blocked === "1") {
       node.disabled = true;
       return;
     }
     node.disabled = busy;
   });
+  if (!busy) syncLookingSend();
 }
 
 function messageFrom(data, status) {
@@ -81,9 +84,108 @@ function messageFrom(data, status) {
   return `The server returned ${status}.`;
 }
 
-async function api(path, { method = "GET", body = null, token = null, timeoutMs = 0 } = {}) {
+function photoProvided(href) {
+  const text = String(href || "").trim();
+  const folded = text.toLowerCase();
+  return text.length > 0 && folded !== "not-provided" && folded !== "not provided";
+}
+
+const LOOKING_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "image/heic",
+  "image/heif",
+]);
+const LOOKING_EXT = /\.(jpe?g|png|webp|gif|heic|heif)$/i;
+const LOOKING_MAX_BYTES = 8 * 1024 * 1024;
+const LOOKING_NONE = new Set(["none", "nothing", "no", "n/a", "na", "skip", "nothing else"]);
+
+function lookingMoment(text) {
+  const cleaned = String(text || "").trim().replace(/\s+/g, " ");
+  if (!cleaned || cleaned.length > 600) return "";
+  if (LOOKING_NONE.has(cleaned.toLowerCase())) return "";
+  return cleaned;
+}
+
+function lookingFileProblem(file) {
+  if (!file) return "Choose a photo to look at.";
+  const type = String(file.type || "").split(";")[0].trim().toLowerCase();
+  const normalized = type === "image/jpg" ? "image/jpeg" : type;
+  const extOk = LOOKING_EXT.test(file.name || "");
+  const typeOk =
+    LOOKING_TYPES.has(normalized) ||
+    ((!normalized || normalized === "application/octet-stream") && extOk);
+  if (!typeOk) return "Choose a photo file.";
+  if (!file.size) return "Choose a photo to look at.";
+  if (file.size > LOOKING_MAX_BYTES) return "That photo is too large. Keep it under 8 MB.";
+  return "";
+}
+
+function syncLookingSend() {
+  const attach = document.getElementById("looking-attach");
+  const input = document.getElementById("photo");
+  const anecdote = document.getElementById("answer");
+  const button = document.getElementById("send");
+  const skip = document.getElementById("looking-skip");
+  const hint = document.getElementById("photo-hint");
+  if (!attach || attach.hidden || !input || !anecdote || !button) return;
+  const file = input.files && input.files[0];
+  const moment = lookingMoment(anecdote.value);
+  const fileProblem = file ? lookingFileProblem(file) : "";
+  button.disabled = state.busy || !moment || Boolean(fileProblem);
+  if (skip) skip.disabled = state.busy || !moment;
+  input.setAttribute("aria-invalid", file && fileProblem ? "true" : "false");
+  anecdote.setAttribute("aria-invalid", anecdote.value.trim() && !moment ? "true" : "false");
+  if (!hint) return;
+  if (file && fileProblem) hint.textContent = fileProblem;
+  else if (anecdote.value.trim() && !moment) {
+    hint.textContent = "I need one moment in your words, even a small one.";
+  } else if (file) hint.textContent = "Photo chosen. I store the file. I do not open it.";
+  else hint.textContent = "No photo chosen. I store the file. I do not open it. You can skip the photo.";
+}
+
+function clearTranscript() {
+  const list = document.getElementById("transcript");
+  if (list) list.replaceChildren();
+}
+
+function renderTranscript(view) {
+  const list = document.getElementById("transcript");
+  if (!list) return;
+  list.replaceChildren();
+  (view.turns || []).forEach((turn) => {
+    if (!turn) return;
+    const item = document.createElement("li");
+    item.className = "turn";
+    const tuck = document.createElement("p");
+    tuck.className = "tuck";
+    tuck.textContent = turn.ask || "";
+    const mine = document.createElement("p");
+    mine.className = "mine";
+    mine.textContent = turn.answer || "";
+    item.append(tuck, mine);
+    if (turn.id === "moment" && view.photo_attached) {
+      const note = document.createElement("p");
+      note.className = "tuck";
+      note.textContent = "A photo is saved with that moment. I did not open it.";
+      item.append(note);
+    }
+    list.append(item);
+  });
+  list.scrollTop = list.scrollHeight;
+}
+
+async function api(path, { method = "GET", body = null, token = null, timeoutMs = 0, form = null } = {}) {
   const headers = { Accept: "application/json" };
-  if (body !== null) headers["Content-Type"] = "application/json";
+  let payload;
+  if (form) {
+    payload = form;
+  } else if (body !== null) {
+    headers["Content-Type"] = "application/json";
+    payload = JSON.stringify(body);
+  }
   if (token) headers["X-Invite-Token"] = token;
   const controller = timeoutMs > 0 ? new AbortController() : null;
   let timer = null;
@@ -95,7 +197,7 @@ async function api(path, { method = "GET", body = null, token = null, timeoutMs 
     response = await fetch(path, {
       method,
       headers,
-      body: body !== null ? JSON.stringify(body) : undefined,
+      body: payload,
       credentials: "same-origin",
       signal: controller ? controller.signal : undefined,
     });
@@ -129,7 +231,9 @@ function hideAll() {
 }
 
 function focusAsk() {
-  const field = desk.querySelector("form:not([hidden]) input, form:not([hidden]) textarea");
+  const field = desk.querySelector(
+    "form:not([hidden]) textarea, form:not([hidden]) input:not([type=file])"
+  );
   if (field) field.focus();
   else askEl.focus();
 }
@@ -137,6 +241,7 @@ function focusAsk() {
 function showAsk(text, panel) {
   askEl.textContent = text;
   hideAll();
+  if (panel === forms.email) clearTranscript();
   if (panel) panel.hidden = false;
   setError("");
   focusAsk();
@@ -185,16 +290,22 @@ async function openSitting(name) {
 
 async function showInterview() {
   const view = await api(`/sessions/${state.sessionId}/interview`, { token: state.token });
+  renderTranscript(view);
   asideEl.hidden = true;
   signOut.hidden = false;
+  const attach = document.getElementById("looking-attach");
   if (view.phase === "probe" && view.probe) {
     state.probeId = view.probe.id;
+    if (attach) attach.hidden = view.probe.id !== "moment";
+    if (view.probe.id === "moment") document.getElementById("photo").value = "";
     showAsk(view.asked, forms.answer);
     document.getElementById("exit").hidden = !view.can_exit;
     document.getElementById("answer").value = "";
+    if (view.probe.id === "moment") syncLookingSend();
     return;
   }
   state.probeId = null;
+  if (attach) attach.hidden = true;
   if (view.phase === "preview") {
     showAsk(view.asked, forms.previewActions);
     return;
@@ -230,6 +341,27 @@ async function showPreview(opts = {}) {
     add(sheet, "h2", "Who this listening is for");
     add(sheet, "p", preview.persona_summary);
   }
+  (Array.isArray(preview.looking) ? preview.looking : []).forEach((item) => {
+    if (!item || !photoProvided(item.photo_href)) return;
+    const fig = document.createElement("figure");
+    fig.className = "looking";
+    const img = document.createElement("img");
+    img.className = "looking-photo looking-thumb";
+    img.alt = "Family photo for this sitting";
+    img.src = item.photo_href;
+    img.addEventListener("error", () => {
+      const note = document.createElement("p");
+      note.textContent = "The photo is saved. This browser cannot show it.";
+      img.replaceWith(note);
+    });
+    fig.appendChild(img);
+    if (item.anecdote) {
+      const cap = document.createElement("figcaption");
+      cap.textContent = item.anecdote;
+      fig.appendChild(cap);
+    }
+    sheet.appendChild(fig);
+  });
   if (preview.qloo_plain) {
     add(sheet, "h2", "What I would ask for");
     add(sheet, "p", preview.qloo_plain);
@@ -370,7 +502,15 @@ async function showGift() {
   });
   if (labels.length) add(sheet, "p", `Left out: ${labels.join(", ")}.`);
   else add(sheet, "p", "You said nothing should be left out.");
-  if (plan.boundary) add(sheet, "p", plan.boundary);
+  if (plan.boundary) {
+    const note = document.createElement("details");
+    note.className = "tech";
+    const summary = document.createElement("summary");
+    summary.textContent = "What this listening is";
+    note.appendChild(summary);
+    add(note, "p", plan.boundary);
+    sheet.appendChild(note);
+  }
   const actions = forms.giftActions;
   actions.replaceChildren();
   actions.hidden = false;
@@ -473,8 +613,12 @@ function setupMic() {
       if (!heard || !heard.transcript) return;
       field.value = field.value ? `${field.value.trim()} ${heard.transcript}` : heard.transcript;
       field.focus();
+      syncLookingSend();
     };
-    rec.onerror = () => setError("The microphone did not catch that. You can type it.");
+    rec.onerror = () => {
+      if (listening === rec) listening = null;
+      setError("The microphone did not catch that. You can type it.");
+    };
     rec.onend = () => {
       if (listening === rec) listening = null;
     };
@@ -573,21 +717,65 @@ document.getElementById("who-else").addEventListener("click", () => {
   showAsk("Who are you helping?", forms.who);
 });
 
-forms.answer.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const text = document.getElementById("answer").value.trim();
+async function sendReply(raw, { skipPhoto = false } = {}) {
+  if (state.busy) return;
+  const attach = document.getElementById("looking-attach");
+  const looking = attach && !attach.hidden;
+  const text = String(raw || "").trim();
+  const input = document.getElementById("photo");
+  const file = !skipPhoto && input && input.files && input.files[0];
+  if (looking) {
+    const moment = lookingMoment(text);
+    if (!moment) {
+      setError("I need one moment in your words, even a small one.");
+      syncLookingSend();
+      return;
+    }
+    if (file) {
+      const fileProblem = lookingFileProblem(file);
+      if (fileProblem) {
+        setError(fileProblem);
+        syncLookingSend();
+        return;
+      }
+      const form = new FormData();
+      form.append("photo", file);
+      form.append("anecdote", moment);
+      setBusy(true);
+      setStatus("Saving the photo.");
+      try {
+        await api(`/sessions/${state.sessionId}/data`, {
+          method: "POST",
+          token: state.token,
+          form,
+        });
+        input.value = "";
+        document.getElementById("answer").value = "";
+        await showInterview();
+        setStatus("");
+      } catch (err) {
+        setError(err.message || "I could not store that photo. Try again.");
+        setStatus("");
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+  }
   if (!text) {
     setError("Say it in a few words, or say none.");
     return;
   }
   setBusy(true);
-  setStatus("Saving that.");
+  setStatus(looking ? "Saving that moment." : "Saving that.");
   try {
     await api(`/sessions/${state.sessionId}/interview`, {
       method: "POST",
       token: state.token,
       body: { text },
     });
+    if (input) input.value = "";
+    document.getElementById("answer").value = "";
     await showInterview();
     setStatus("");
   } catch (err) {
@@ -596,6 +784,19 @@ forms.answer.addEventListener("submit", async (event) => {
   } finally {
     setBusy(false);
   }
+}
+
+document.getElementById("photo").addEventListener("change", syncLookingSend);
+document.getElementById("answer").addEventListener("input", syncLookingSend);
+document.getElementById("looking-skip").addEventListener("click", () => {
+  const input = document.getElementById("photo");
+  if (input) input.value = "";
+  sendReply(document.getElementById("answer").value, { skipPhoto: true });
+});
+
+forms.answer.addEventListener("submit", (event) => {
+  event.preventDefault();
+  sendReply(document.getElementById("answer").value);
 });
 
 document.getElementById("exit").addEventListener("click", async () => {
@@ -648,6 +849,12 @@ forms.feedback.addEventListener("submit", async (event) => {
       body: { id: state.feedbackId, text },
     });
     document.getElementById("feedback").value = "";
+    try {
+      const view = await api(`/sessions/${state.sessionId}/interview`, { token: state.token });
+      renderTranscript(view);
+    } catch (_refresh) {
+      /* The note is already saved. The log fills in on the next load. */
+    }
     if (saved.pending) {
       state.feedbackId = saved.pending;
       showAsk(saved.ask, forms.feedback);
@@ -689,8 +896,8 @@ document.getElementById("sample").addEventListener("click", async () => {
     rememberSession(sample.session_id, sample.invite_token);
     state.personName = sample.caregiver_label;
     asideEl.hidden = true;
-    showAsk(sample.note, forms.previewActions);
-    setStatus("");
+    await showInterview();
+    setStatus(sample.note || "");
   } catch (err) {
     setError(err.message);
     setStatus("");

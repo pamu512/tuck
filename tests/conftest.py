@@ -67,7 +67,12 @@ def tuck_session_secret(monkeypatch):
 @pytest.fixture
 def client(tmp_path, fake_qloo) -> TestClient:
     return TestClient(
-        create_app(store_path=tmp_path / "store.json", qloo=fake_qloo, spotify_client_id="")
+        create_app(
+            store_path=tmp_path / "store.json",
+            qloo=fake_qloo,
+            spotify_client_id="",
+            photo_dir=tmp_path / "photos",
+        )
     )
 
 

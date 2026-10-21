@@ -2,7 +2,14 @@
 
 import json
 
-from app.interview import can_exit, materialize, next_probe, persona_summary, soft_normalize_interest
+from app.interview import (
+    acknowledge,
+    can_exit,
+    materialize,
+    next_probe,
+    persona_summary,
+    soft_normalize_interest,
+)
 from app.session import candidate_reason, resolve_signals
 
 
@@ -310,6 +317,17 @@ def test_persona_summary_from_sample_answers():
     assert "photo" not in text.casefold() or "never" in portrait["qloo_plain"].casefold()
     assert portrait["facets"]["interests"]
     assert "music" in portrait["qloo_plain"].casefold()
+
+
+def test_acknowledge_quotes_their_words():
+    assert acknowledge("gardening") == 'I\'ll keep "gardening."'
+    assert acknowledge("  none  ") == "I'll leave that as none."
+    assert acknowledge("skip") == "I'll leave that as none."
+    clipped = acknowledge("word " * 40)
+    assert clipped.startswith('I\'ll keep "')
+    assert clipped.endswith('...".')
+    assert "\u2014" not in clipped
+    assert acknowledge("") == ""
 
 
 def test_persona_summary_does_not_invent_from_empty():

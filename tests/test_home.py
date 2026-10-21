@@ -15,6 +15,10 @@ def test_root_is_tuck_account_first(client):
     assert "<details" in text and "Advanced" in text
     assert "Open the sample family" in text
     assert text.index("Advanced") < text.index("Open the sample family")
+    assert 'id="transcript"' in text
+    assert 'id="form-looking"' not in text
+    assert "for a demo" not in text
+    assert "Skip the photo" in text
     assert "half an hour to two hours" in text
     assert "not therapy" in text
     assert "Get Started" not in text

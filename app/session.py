@@ -30,6 +30,7 @@ from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from .looking import looking_entries
 from .qloo import INSIGHT_TYPES
 
 MAX_UPLOADS_PER_SESSION = 20
@@ -689,6 +690,7 @@ def preview_payload(
         "session_id": session["id"],
         "caregiver_label": session["caregiver_label"],
         "photo_count": len(session["uploads"]),
+        "looking": looking_entries(session.get("uploads") or []),
         "anecdotes": [upload["anecdote"] for upload in session["uploads"]],
         "explicit_interests": collect_interests(session),
         "signals": kept_signals,

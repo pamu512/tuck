@@ -17,6 +17,8 @@ unauthenticated session, and it only loads the canned sample family.
     POST   /sessions/{id}/interview
     POST   /sessions/{id}/feedback
     POST   /sessions/{id}/uploads
+    POST   /sessions/{id}/data
+    GET    /data/{photo_id}
     POST   /sessions/{id}/exclusions
     POST   /sessions/{id}/preview
     POST   /sessions/{id}/guide
@@ -41,7 +43,7 @@ from typing import Any, Literal
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -89,14 +91,30 @@ from .playlist import (
     uris_to_add,
 )
 from .interview import (
+    FEEDBACK,
     persona_summary,
     NO_PHOTO,
+    PROBES,
+    PROBES_BY_ID,
+    acknowledge,
+    apply_looking_photo,
     can_exit,
     fresh_interview,
     materialize,
     next_probe,
     pending_feedback,
     validate_answer,
+)
+from .looking import (
+    PHOTO_ID_RE,
+    PhotoStoreError,
+    allocate_photo_id,
+    discard_opaque,
+    normalize_media_type,
+    photo_provided,
+    read_photo_bytes,
+    session_photo_media,
+    store_opaque,
 )
 from .qloo import INSIGHT_TYPES, QlooAuthError, QlooClient, QlooUpstreamError
 from .sample import SAMPLE
@@ -128,6 +146,26 @@ _COOKIE_INVITE = "gml_invite"
 def default_store_path() -> Path:
     env_path = os.environ.get("GML_STORE_PATH")
     return Path(env_path) if env_path else REPO_ROOT / "data" / "store.json"
+
+
+def default_photo_root() -> Path:
+    """Disk for opaque photo bytes. The public path is always /data/{id}."""
+    env_path = os.environ.get("GML_DATA_DIR", "").strip()
+    if env_path:
+        path = Path(env_path)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    preferred = Path("/data")
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        probe = preferred / ".gml-write-probe"
+        probe.write_bytes(b"ok")
+        probe.unlink()
+        return preferred
+    except OSError:
+        fallback = REPO_ROOT / "data" / "photos"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 def request_is_https(request: Request) -> bool:
@@ -176,6 +214,7 @@ def create_app(
     spotify_client_id: str | None = None,
     spotify_factory: Any | None = None,
     session_secret: str | None = None,
+    photo_dir: str | Path | None = None,
 ) -> FastAPI:
     """Build the app. Tests inject a store path, a Qloo double, and Spotify."""
     app = FastAPI(title="Tuck", version="0.3.0", description=APP_DESCRIPTION)
@@ -195,6 +234,8 @@ def create_app(
         else _env_positive_int("GML_MAX_SESSIONS", domain.DEFAULT_MAX_SESSIONS)
     )
     app.state.store = store
+    app.state.photo_dir = Path(photo_dir) if photo_dir is not None else default_photo_root()
+    app.state.photo_dir.mkdir(parents=True, exist_ok=True)
     app.state.session_ttl_seconds = ttl
     app.state.max_sessions = session_cap
 
@@ -234,6 +275,7 @@ def create_app(
         session = store.get(session_id)
         if session is None or domain.session_expired(session, ttl):
             if session is not None:
+                discard_session_photos(session)
                 store.delete(session_id)
             raise HTTPException(status_code=404, detail="session not found")
         if not domain.verify_invite(session, token):
@@ -324,6 +366,32 @@ def create_app(
         else:
             phase = "preview"
             asked = "I can build the preview from what you told me. Nothing is requested until you say so."
+        turns: list[dict[str, str]] = []
+        for item in PROBES:
+            text = answers.get(item["id"])
+            if text is None:
+                continue
+            turns.append({"id": item["id"], "ask": item["ask"], "answer": str(text)})
+        if session.get("sealed"):
+            saved_feedback = session.get("feedback") or {}
+            for item in FEEDBACK:
+                text = str(saved_feedback.get(item["id"]) or "").strip()
+                if text:
+                    turns.append({"id": item["id"], "ask": item["ask"], "answer": text})
+        if phase in ("probe", "preview") and turns:
+            heard = acknowledge(turns[-1]["answer"])
+            if heard:
+                asked = f"{heard} {asked}"
+        attached = False
+        paths = [interview.get("photo_path")]
+        for upload in session.get("uploads") or []:
+            if isinstance(upload, dict):
+                paths.append(upload.get("photo_path"))
+        for path in paths:
+            href = str(path or "").strip()
+            if href.startswith("/data/") and photo_provided(href):
+                attached = True
+                break
         return {
             "phase": phase,
             "asked": asked,
@@ -333,6 +401,8 @@ def create_app(
             "can_exit": bool(probe) and can_exit(answers, exited) and not committed,
             "committed": committed,
             "answer_count": len(answers),
+            "turns": turns,
+            "photo_attached": attached,
             "caregiver_label": session.get("caregiver_label") or "",
             "feedback_id": pending["id"] if pending else None,
             "feedback_ask": pending["ask"] if pending else None,
@@ -342,7 +412,10 @@ def create_app(
         interview = session.setdefault("interview", fresh_interview())
         if interview.get("committed"):
             return
-        built = materialize(dict(interview.get("answers") or {}))
+        built = materialize(
+            dict(interview.get("answers") or {}),
+            photo_path=str(interview.get("photo_path") or NO_PHOTO),
+        )
         if not built["anecdote"]:
             raise HTTPException(status_code=409, detail="I still need one moment in your words.")
         if not built["interests"]:
@@ -354,14 +427,17 @@ def create_app(
             raise HTTPException(status_code=409, detail="Tell me what should stay out before the preview.")
         try:
             domain.require_open(session)
-            domain.add_upload(
+            upload = domain.add_upload(
                 session,
                 domain.UploadRequest(
-                    photo_path=NO_PHOTO,
+                    photo_path=built["photo_path"],
                     anecdote=built["anecdote"],
                     interests=built["interests"],
                 ),
             )
+            media = interview.get("photo_type")
+            if media:
+                upload["photo_type"] = media
             exclusions = domain.acknowledge_exclusions(
                 session,
                 domain.ExclusionsRequest(
@@ -470,6 +546,61 @@ def create_app(
         response.set_cookie(_COOKIE_SESSION, session_id, **common)
         response.set_cookie(_COOKIE_INVITE, token, **common)
 
+    def set_photo_cookies(response: Response, request: Request, session_id: str, token: str) -> None:
+        common = {
+            "httponly": True,
+            "samesite": "lax",
+            "secure": request_is_https(request),
+            "path": "/",
+            "max_age": ttl,
+        }
+        response.set_cookie(_COOKIE_SESSION, session_id, **common)
+        response.set_cookie(_COOKIE_INVITE, token, **common)
+
+    def opaque_photo_hrefs(session: dict[str, Any]) -> list[str]:
+        hrefs: list[str] = []
+        interview = session.get("interview") or {}
+        path = interview.get("photo_path")
+        if isinstance(path, str) and path.startswith("/data/"):
+            hrefs.append(path)
+        interview["photo_path"] = ""
+        interview["photo_type"] = ""
+        for upload in session.get("uploads") or []:
+            if not isinstance(upload, dict):
+                continue
+            stored = upload.get("photo_path")
+            if isinstance(stored, str) and stored.startswith("/data/"):
+                hrefs.append(stored)
+        return hrefs
+
+    def discard_session_photos(session: dict[str, Any]) -> None:
+        for href in opaque_photo_hrefs(session):
+            discard_opaque(app.state.photo_dir, href)
+
+    def insert_session(session: dict[str, Any]) -> None:
+        expired_rows = [
+            (sid, existing)
+            for sid, existing in store.read_all().items()
+            if isinstance(existing, dict) and domain.session_expired(existing, ttl)
+        ]
+        inserted = store.insert_if_room(
+            session,
+            session_cap,
+            {sid for sid, _existing in expired_rows},
+        )
+        for sid, row in expired_rows:
+            # File lock is already released. Take the stripe so a photo read finishes first.
+            with store.session_scope(sid):
+                discard_session_photos(row)
+        if not inserted:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"session limit reached ({session_cap}). Delete a session "
+                    "or wait for unused sessions to expire."
+                ),
+            )
+
     def playlist_redirect(flag: str, code: str | None = None) -> RedirectResponse:
         query = {"playlist": flag}
         if code:
@@ -493,6 +624,7 @@ def create_app(
             or path.startswith("/login")
             or path.startswith("/me")
             or path.startswith("/dev")
+            or path.startswith("/data")
         )
         if private:
             response.headers["Cache-Control"] = "no-store"
@@ -608,19 +740,7 @@ def create_app(
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         session["interview"]["committed"] = True
         session["interview"]["answers"] = {"leave_out": "war documentaries"}
-        expired = {
-            sid
-            for sid, existing in store.read_all().items()
-            if domain.session_expired(existing, ttl)
-        }
-        if not store.insert_if_room(session, session_cap, expired):
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"session limit reached ({session_cap}). Delete a session "
-                    "or wait for unused sessions to expire."
-                ),
-            )
+        insert_session(session)
         return {
             "session_id": session["id"],
             "invite_token": token,
@@ -634,19 +754,7 @@ def create_app(
         account = require_account(request)
         session, token = domain.new_invite(body.caregiver_label)
         attach_account(session, account)
-        expired = {
-            sid
-            for sid, existing in store.read_all().items()
-            if domain.session_expired(existing, ttl)
-        }
-        if not store.insert_if_room(session, session_cap, expired):
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"session limit reached ({session_cap}). Delete a session "
-                    "or wait for unused sessions to expire."
-                ),
-            )
+        insert_session(session)
         body = {
             "session_id": session["id"],
             "invite_token": token,
@@ -791,6 +899,178 @@ def create_app(
                 "guide": guide_status(session),
             }
 
+    @app.post("/sessions/{session_id}/data", status_code=201)
+    def add_looking_photo(
+        session_id: str,
+        http_request: Request,
+        response: Response,
+        photo: UploadFile | None = File(default=None),
+        anecdote: str = Form(default=""),
+        x_invite_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        def ensure_looking_turn(session: dict[str, Any]) -> dict[str, Any]:
+            try:
+                domain.require_open(session)
+            except domain.SessionError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            interview = session.setdefault("interview", fresh_interview())
+            if interview.get("committed"):
+                return interview
+            answers = dict(interview.get("answers") or {})
+            probe = next_probe(answers, bool(interview.get("exited")))
+            if probe is None or probe["id"] != "moment":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Tell me the moment when I ask for it.",
+                )
+            return interview
+
+        stored_href = ""
+        previous = ""
+        saved = False
+        body: dict[str, Any] = {}
+        try:
+            # Token first, then the moment, then the bytes.
+            with store.session_scope(session_id):
+                load_session(session_id, x_invite_token, http_request)
+            if photo is None:
+                raise HTTPException(status_code=422, detail="Choose a photo to look at.")
+            try:
+                text = validate_answer(PROBES_BY_ID["moment"], anecdote)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            with store.session_scope(session_id):
+                ensure_looking_turn(load_session(session_id, x_invite_token, http_request))
+            try:
+                media = normalize_media_type(photo.content_type, photo.filename)
+                blob = read_photo_bytes(photo.file)
+            except PhotoStoreError as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+            try:
+                with store.session_scope(session_id):
+                    session = load_session(session_id, x_invite_token, http_request)
+                    interview = ensure_looking_turn(session)
+                    pending_probe = None
+                    if not interview.get("committed"):
+                        answers = dict(interview.get("answers") or {})
+                        exited = bool(interview.get("exited"))
+                        probe = next_probe(answers, exited)
+                        answers["moment"] = text
+                        interview["answers"] = answers
+                        if probe is not None:
+                            pending_probe = probe
+                    previous = str(interview.get("photo_path") or "")
+                    try:
+                        photo_id = allocate_photo_id(app.state.photo_dir)
+                        href = f"/data/{photo_id}"
+                        store_opaque(app.state.photo_dir, photo_id, blob)
+                    except PhotoStoreError as exc:
+                        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+                    stored_href = href
+                    apply_looking_photo(session, href=href, media_type=media, anecdote=text)
+                    if not interview.get("committed"):
+                        if next_probe(
+                            dict(interview.get("answers") or {}),
+                            bool(interview.get("exited")),
+                        ) is None:
+                            commit_interview(session)
+                    try:
+                        store.put(session)
+                    except (OSError, StoreError) as exc:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="I could not store that photo. Try again.",
+                        ) from exc
+                    saved = True
+                    if pending_probe is not None:
+                        account_id = session.get("account_id")
+                        if account_id:
+                            account = accounts.get(account_id)
+                            if account:
+                                write_probe(
+                                    account,
+                                    {
+                                        "id": pending_probe["id"],
+                                        "topic": pending_probe["topic"],
+                                        "prompt": pending_probe["ask"],
+                                        "answer": text,
+                                    },
+                                )
+                                save_account(account)
+                    body = interview_view(session)
+                    body["photo_href"] = href
+                    body["photo_on_file"] = True
+                    body["anecdote_chars"] = len(text)
+                    body["photo_note"] = (
+                        "Stored as an opaque file. The photo is never opened or analyzed."
+                    )
+            except Exception:
+                if stored_href and not saved:
+                    discard_opaque(app.state.photo_dir, stored_href)
+                    stored_href = ""
+                raise
+            if previous.startswith("/data/") and previous != body["photo_href"]:
+                discard_opaque(app.state.photo_dir, previous)
+            if x_invite_token:
+                set_photo_cookies(response, http_request, session_id, x_invite_token)
+            return body
+        finally:
+            closer = getattr(photo, "file", None)
+            if closer is not None:
+                try:
+                    closer.close()
+                except Exception:
+                    pass
+
+    @app.get("/data/{photo_id}")
+    def serve_looking_photo(
+        photo_id: str,
+        request: Request,
+        x_invite_token: str | None = Header(default=None),
+    ) -> Response:
+        if not PHOTO_ID_RE.fullmatch(photo_id):
+            raise HTTPException(status_code=404, detail="That photo is not on file.")
+        href = f"/data/{photo_id}"
+        token = x_invite_token or request.cookies.get(_COOKIE_INVITE)
+        owner_id = ""
+        media = ""
+        blob = b""
+        # ponytail: scans the session file for the photo id, then reads the
+        # bytes under that session's stripe so a seal cannot unlink mid-read.
+        # Ceiling: GML_MAX_SESSIONS and 8 MB in memory. Upgrade path: a photo-id index.
+        for sid, raw in store.read_all().items():
+            if isinstance(raw, dict) and session_photo_media(raw, href):
+                owner_id = sid
+                break
+        if not owner_id:
+            raise HTTPException(status_code=404, detail="That photo is not on file.")
+        with store.session_scope(owner_id):
+            session = load_session(owner_id, token, request)
+            media = session_photo_media(session, href)
+            if not media:
+                raise HTTPException(status_code=404, detail="That photo is not on file.")
+            path = (app.state.photo_dir / photo_id).resolve()
+            root = app.state.photo_dir.resolve()
+            if path.parent != root or not path.is_file():
+                raise HTTPException(status_code=404, detail="That photo is not on file.")
+            try:
+                blob = path.read_bytes()
+            except OSError as exc:
+                raise HTTPException(status_code=404, detail="That photo is not on file.") from exc
+        return Response(
+            content=blob,
+            media_type=media,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+                "Content-Disposition": "inline",
+                "Content-Security-Policy": "default-src 'none'",
+                "Cross-Origin-Resource-Policy": "same-origin",
+            },
+        )
+
     @app.post("/sessions/{session_id}/exclusions")
     def set_exclusions(
         session_id: str,
@@ -827,6 +1107,7 @@ def create_app(
     def preview(
         session_id: str,
         request: Request,
+        response: Response,
         x_invite_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
@@ -868,6 +1149,8 @@ def create_app(
             body["guide"] = guide_status(session)
             body["guide"]["tools"] = trace["tools"]
             body["guide"]["input"] = trace["input"]
+            if x_invite_token and body.get("looking"):
+                set_photo_cookies(response, request, session_id, x_invite_token)
             return body
 
     @app.post("/sessions/{session_id}/guide")
@@ -966,10 +1249,13 @@ def create_app(
             for candidate in kept:
                 candidate["why"] = domain.candidate_reason(candidate["name"], kept_signals)
             payload = domain.candidates_payload(session, kept, removed, types_failed)
+            photo_hrefs = opaque_photo_hrefs(session)
             domain.seal_for_export(session, payload)
             payload["guide"] = guide_status(session)
             store.put(session)
-            return payload
+            for href in photo_hrefs:
+                discard_opaque(app.state.photo_dir, href)
+        return payload
 
     @app.get("/sessions/{session_id}/export")
     def export_session(
@@ -1044,16 +1330,58 @@ def create_app(
 
     @app.get("/spotify/callback", name="spotify_callback")
     def spotify_callback(request: Request) -> RedirectResponse:
-        if request.query_params.get("error"):
-            return playlist_redirect("error", "denied")
         code = (request.query_params.get("code") or "").strip()
         state = (request.query_params.get("state") or "").strip()
         session_id = request.cookies.get(_COOKIE_SESSION, "")
         token = request.cookies.get(_COOKIE_INVITE, "")
+        access_token = ""
+        hidden: list[str] = []
+
+        def log_failure(err_code: str, detail: str) -> str:
+            safe = detail
+            for secret in (code, access_token, token, *hidden):
+                if secret:
+                    safe = safe.replace(secret, "[REDACTED]")
+            safe = safe[:180]
+            _spotify_log.warning(
+                "spotify callback failed session=%s err=%s detail=%s",
+                session_id or "-",
+                err_code,
+                safe,
+            )
+            return safe
+
+        def fail(err_code: str, detail: str) -> RedirectResponse:
+            """Log scrubbed detail, persist playlist_error, redirect.
+
+            Do not call this while session_scope is held: the stripe lock is not reentrant.
+            """
+            safe = log_failure(err_code, detail)
+            if session_id:
+                try:
+                    with store.session_scope(session_id):
+                        stored = store.get(session_id)
+                        if stored is not None:
+                            stored["playlist_error"] = {"code": err_code, "detail": safe}
+                            store.put(stored)
+                except Exception:
+                    _spotify_log.warning(
+                        "spotify callback failed session=%s err=%s detail=%s",
+                        session_id,
+                        err_code,
+                        "playlist_error was not saved",
+                    )
+            return playlist_redirect("error", err_code)
+
+        spotify_error = (request.query_params.get("error") or "").strip()
+        if spotify_error:
+            if len(spotify_error) > 40 or not spotify_error.replace("-", "").replace("_", "").isalnum():
+                spotify_error = "denied"
+            return fail("denied", f"authorization error {spotify_error}")
         if not session_id or not token:
-            return playlist_redirect("error", "cookie")
+            return fail("cookie", "oauth cookies were missing on the return")
         if not code or not state:
-            return playlist_redirect("error", "state")
+            return fail("state", "authorization code or state was missing")
 
         # Verifier is single-use. Clear it before Spotify so a slow search
         # does not hold the session stripe, and a second callback cannot reuse it.
@@ -1068,22 +1396,38 @@ def create_app(
                     flag = "cookie"
                 else:
                     flag = "invite"
+                safe = log_failure(flag, f"session load failed status={exc.status_code}")
+                if exc.status_code != 404:
+                    stored = store.get(session_id)
+                    if stored is not None:
+                        stored["playlist_error"] = {"code": flag, "detail": safe}
+                        store.put(stored)
                 return playlist_redirect("error", flag)
+
+            def fail_locked(err_code: str, detail: str, *, clear_oauth: bool = False) -> RedirectResponse:
+                if clear_oauth:
+                    session["spotify_oauth"] = None
+                session["playlist_error"] = {
+                    "code": err_code,
+                    "detail": log_failure(err_code, detail),
+                }
+                store.put(session)
+                return playlist_redirect("error", err_code)
+
             oauth = session.get("spotify_oauth") or {}
             if not oauth or oauth.get("state") != state:
-                return playlist_redirect("error", "state")
+                return fail_locked("state", "oauth state did not match this sitting")
             if oauth_expired(str(oauth.get("created_at") or "")):
-                session["spotify_oauth"] = None
-                store.put(session)
-                return playlist_redirect("error", "stale")
+                return fail_locked("stale", "oauth step expired", clear_oauth=True)
             try:
                 payload = require_music_export(session)
             except HTTPException:
-                session["spotify_oauth"] = None
-                store.put(session)
-                return playlist_redirect("error", "state")
+                return fail_locked("state", "candidate list is not ready", clear_oauth=True)
+            verifier = str(oauth.get("verifier") or "")
+            if verifier:
+                hidden.append(verifier)
             job = {
-                "verifier": str(oauth.get("verifier") or ""),
+                "verifier": verifier,
                 "redirect_uri": str(oauth.get("redirect_uri") or spotify_redirect(request)),
                 "candidates": list(payload.get("candidates") or []),
                 "exclusions": list(session.get("exclusions") or []),
@@ -1093,37 +1437,9 @@ def create_app(
             store.put(session)
 
         if job is None:
-            return playlist_redirect("error", "state")
-
-        def fail(err_code: str, detail: str) -> RedirectResponse:
-            """Log scrubbed detail, persist playlist_error, redirect.
-
-            Every Spotify-API failure path funnels through here so no branch
-            can redirect with an error code and leave nothing behind.
-            """
-            safe = detail
-            for secret in (access_token, code, str(job.get("verifier") or "")):
-                if secret:
-                    safe = safe.replace(secret, "[REDACTED]")
-            safe = safe[:180]
-            _spotify_log.warning(
-                "spotify callback failed session=%s err=%s detail=%s",
-                session_id,
-                err_code,
-                safe,
-            )
-            try:
-                with store.session_scope(session_id):
-                    session = store.get(session_id)
-                    if session is not None:
-                        session["playlist_error"] = {"code": err_code, "detail": safe}
-                        store.put(session)
-            except Exception:
-                pass
-            return playlist_redirect("error", err_code)
+            return fail("state", "oauth job was empty")
 
         created: dict[str, Any] | None = None
-        access_token = ""
         tracks: list[dict[str, Any]] = []
         withheld: list[dict[str, Any]] = []
         api = make_spotify(job["redirect_uri"])
@@ -1156,15 +1472,28 @@ def create_app(
                     if item.get("field") == "search" and item.get("reason") == "error"
                 ]
                 if search_errors:
-                    # Spotify rejected the artist lookups (dev-mode allowlist,
-                    # lapsed owner Premium, rate limit). Not a content outcome.
-                    artists = ", ".join(str(item.get("name") or "") for item in search_errors)
+                    # Spotify rejected the lookups. Detail leads so the 180-char
+                    # scrub keeps the API message instead of the artist list.
                     first_detail = str(search_errors[0].get("detail") or "search failed")
                     return fail(
                         "search",
-                        f"artist lookup failed for {len(search_errors)}: [{artists}] {first_detail}",
+                        f"{len(search_errors)} artist lookups failed: {first_detail}",
                     )
-                return fail("empty", "no music candidate resolved to a playable track")
+                music_count = sum(
+                    1
+                    for candidate in job["candidates"]
+                    if candidate.get("type") == "music" and str(candidate.get("name") or "").strip()
+                )
+                withheld_bits: list[str] = []
+                for item in withheld:
+                    field = str(item.get("field") or "")
+                    reason = str(item.get("reason") or "")
+                    withheld_bits.append(f"{field}/{reason}" if reason else field)
+                summary = ", ".join(withheld_bits)[:100]
+                return fail(
+                    "empty",
+                    f"no playable track from {music_count} music candidates ({summary or 'none withheld'})",
+                )
             created = api.create_private_playlist(
                 access_token,
                 playlist_name(job["label"]),
@@ -1211,7 +1540,17 @@ def create_app(
                     flag = "cookie"
                 else:
                     flag = "invite"
-                return playlist_redirect("error", flag)
+                session = store.get(session_id)
+                if session is None:
+                    log_failure(
+                        flag,
+                        f"playlist created but session reload failed status={exc.status_code}",
+                    )
+                    return playlist_redirect("error", flag)
+                log_failure(
+                    flag,
+                    f"session reload status={exc.status_code}; kept the playlist on the stored row",
+                )
             session["playlist"] = {
                 "id": created["id"],
                 "url": created["url"],
@@ -1220,6 +1559,7 @@ def create_app(
                 "tracks": tracks,
                 "withheld": withheld,
             }
+            session["playlist_error"] = None
             store.put(session)
         return playlist_redirect("ready")
 
@@ -1230,8 +1570,9 @@ def create_app(
         x_invite_token: str | None = Header(default=None),
     ) -> Response:
         with store.session_scope(session_id):
-            load_session(session_id, x_invite_token, request)
+            session = load_session(session_id, x_invite_token, request)
             store.delete(session_id)
+            discard_session_photos(session)
         return Response(status_code=204)
 
     @app.exception_handler(StoreError)

@@ -286,7 +286,7 @@ def test_spotify_callback_creates_a_private_playlist_without_excluded_tracks(tmp
     assert client.app.state.store.get(session_id)["playlist"]["public"] is False
 
 
-def test_spotify_callback_redirects_when_the_list_is_not_ready(tmp_path, fake_qloo):
+def test_spotify_callback_redirects_when_the_list_is_not_ready(tmp_path, fake_qloo, caplog):
     calls = {"n": 0}
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -316,6 +316,7 @@ def test_spotify_callback_redirects_when_the_list_is_not_ready(tmp_path, fake_ql
     client.app.state.store.put(session)
     client.cookies.set("gml_session", session_id)
     client.cookies.set("gml_invite", token)
+    caplog.set_level(logging.WARNING, logger="tuck.spotify")
     response = client.get(
         "/spotify/callback",
         params={"code": "auth-code", "state": "bound-state"},
@@ -323,9 +324,16 @@ def test_spotify_callback_redirects_when_the_list_is_not_ready(tmp_path, fake_ql
     )
     assert response.status_code == 303, response.text
     assert response.headers["location"].startswith("/?playlist=error")
+    assert "code=state" in response.headers["location"]
     assert "auth-code" not in response.headers["location"]
     assert calls["n"] == 0
-    assert client.app.state.store.get(session_id)["spotify_oauth"] is None
+    stored = client.app.state.store.get(session_id)
+    assert stored["spotify_oauth"] is None
+    assert stored["playlist_error"]["code"] == "state"
+    assert "not ready" in stored["playlist_error"]["detail"]
+    assert "auth-code" not in stored["playlist_error"]["detail"]
+    assert "err=state" in caplog.text
+    assert "auth-code" not in caplog.text
 
 
 def test_a_failed_track_add_discards_the_empty_playlist(tmp_path, fake_qloo):
@@ -680,7 +688,9 @@ def test_spotify_callback_zero_results_is_empty_not_upstream(tmp_path, fake_qloo
     stored = client.app.state.store.get(session_id)
     error = stored.get("playlist_error") or {}
     assert error.get("code") == "empty"
+    assert "music candidates" in str(error.get("detail"))
     assert [r for r in caplog.records if "spotify callback failed" in r.message]
+    assert "err=empty" in caplog.text
 
 
 def test_spotify_search_sends_explicit_market(tmp_path, fake_qloo):
@@ -820,3 +830,125 @@ def test_spotify_search_falls_back_to_default_market_when_me_omits_country(tmp_p
     assert "playlist=ready" in callback.headers["location"]
     assert seen["markets"]
     assert all(m == "GB" for m in seen["markets"])
+
+
+def test_spotify_denial_and_missing_cookies_are_logged(tmp_path, fake_qloo, caplog):
+    caplog.set_level(logging.WARNING, logger="tuck.spotify")
+    client = TestClient(
+        create_app(
+            store_path=tmp_path / "store.json",
+            qloo=fake_qloo,
+            spotify_client_id="test-client",
+        )
+    )
+    session_id, headers = start_session(client)
+    client.cookies.set("gml_session", session_id)
+    client.cookies.set("gml_invite", headers["X-Invite-Token"])
+    denied = client.get(
+        "/spotify/callback",
+        params={"error": "access_denied"},
+        follow_redirects=False,
+    )
+    assert denied.status_code == 303
+    assert "code=denied" in denied.headers["location"]
+    assert client.app.state.store.get(session_id)["playlist_error"]["code"] == "denied"
+    assert "err=denied" in caplog.text
+    assert "access_denied" in caplog.text
+
+    bare = TestClient(
+        create_app(
+            store_path=tmp_path / "store-bare.json",
+            qloo=fake_qloo,
+            spotify_client_id="test-client",
+        )
+    )
+    missing = bare.get(
+        "/spotify/callback",
+        params={"code": "auth-code", "state": "abc"},
+        follow_redirects=False,
+    )
+    assert missing.status_code == 303
+    assert "code=cookie" in missing.headers["location"]
+    assert "err=cookie" in caplog.text
+    assert "auth-code" not in caplog.text
+
+
+def test_spotify_callback_bad_invite_is_stored(tmp_path, fake_qloo, caplog):
+    caplog.set_level(logging.WARNING, logger="tuck.spotify")
+    client = TestClient(
+        create_app(
+            store_path=tmp_path / "store.json",
+            qloo=fake_qloo,
+            spotify_client_id="test-client",
+        )
+    )
+    session_id, _headers = start_session(client)
+    session = client.app.state.store.get(session_id)
+    session["spotify_oauth"] = {
+        "state": "bound-state",
+        "verifier": "verifier-value-verifier-value-verifier",
+        "created_at": session["created_at"],
+        "redirect_uri": "http://testserver/spotify/callback",
+    }
+    client.app.state.store.put(session)
+    client.cookies.set("gml_session", session_id)
+    client.cookies.set("gml_invite", "wrong-invite-token")
+    response = client.get(
+        "/spotify/callback",
+        params={"code": "auth-code", "state": "bound-state"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "code=cookie" in response.headers["location"]
+    error = client.app.state.store.get(session_id)["playlist_error"]
+    assert error["code"] == "cookie"
+    assert "status=401" in error["detail"]
+    assert "auth-code" not in error["detail"]
+    assert "wrong-invite-token" not in error["detail"]
+    assert "verifier-value" not in caplog.text
+    assert "err=cookie" in caplog.text
+
+
+def test_plain_search_fallback_drops_a_different_artist():
+    seen = {"markets": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["markets"].append(request.url.params.get("market"))
+        query = request.url.params.get("q") or ""
+        if query.startswith("artist:"):
+            return httpx.Response(200, json={"tracks": {"items": []}})
+        return httpx.Response(
+            200,
+            json={
+                "tracks": {
+                    "items": [
+                        {
+                            "id": "wrong",
+                            "uri": "spotify:track:wrong",
+                            "name": "Tribute",
+                            "artists": [{"name": "Someone Else"}],
+                            "album": {"name": "Covers"},
+                        },
+                        {
+                            "id": "right",
+                            "uri": "spotify:track:right",
+                            "name": "Unforgettable",
+                            "artists": [{"name": "Nat King Cole"}],
+                            "album": {"name": "The Very Best"},
+                        },
+                    ]
+                }
+            },
+        )
+
+    api = SpotifyAPI(
+        "test-client",
+        "http://testserver/spotify/callback",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        tracks = api.search_artist_tracks("spot-access-token", "Nat King Cole", market="US")
+    finally:
+        api.close()
+    assert [track["uri"] for track in tracks] == ["spotify:track:right"]
+    assert seen["markets"] == ["US", "US"]

@@ -8,8 +8,8 @@ The description names the family label and nothing else.
 from __future__ import annotations
 
 import base64
-import os
 import hashlib
+import os
 import secrets
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -379,6 +379,8 @@ class SpotifyAPI:
         if limit > 10:
             limit = 10
         use_market = (market or self._market or self.default_market).strip().upper()[:2]
+        if len(use_market) != 2:
+            use_market = self.default_market
         params: dict[str, str] = {
             "q": f'artist:"{safe_artist}"',
             "type": "track",
@@ -417,7 +419,7 @@ class SpotifyAPI:
                 if not isinstance(item, dict):
                     continue
                 normalized = _normalize_spotify_track(item)
-                if normalized:
+                if normalized and _artist_matches(safe_artist, normalized.get("artists") or []):
                     tracks.append(normalized)
         return tracks
 
@@ -467,6 +469,26 @@ class SpotifyAPI:
             headers={"Authorization": f"Bearer {token}"},
         )
         self._raise(response, token, playlist_id)
+
+
+def _artist_matches(want: str, names: list[Any]) -> bool:
+    """Plain-query fallback only. A quoted artist filter already constrained the hit.
+
+    ponytail: substring match once both sides are at least 4 characters.
+    Ceiling: a short shared name can match two people. Upgrade path: Spotify artist id.
+    """
+    needle = want.casefold().strip()
+    if len(needle) < 2:
+        return False
+    for name in names:
+        hay = str(name or "").casefold().strip()
+        if not hay:
+            continue
+        if needle == hay:
+            return True
+        if len(needle) >= 4 and len(hay) >= 4 and (needle in hay or hay in needle):
+            return True
+    return False
 
 
 def _normalize_spotify_track(item: dict[str, Any]) -> dict[str, Any] | None:

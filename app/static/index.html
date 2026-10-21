@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Tuck</title>
-  <meta name="description" content="Tuck asks one question at a time, then makes a private listening gift.">
+  <meta name="description" content="Tuck asks the person who is helping, one question at a time, then makes a private listening gift.">
   <meta name="theme-color" content="#f6f1e7">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -22,10 +22,11 @@
     <main id="desk">
       <p id="status" class="status" role="status"></p>
       <p id="error" class="error" role="alert" hidden></p>
+      <ol id="transcript" class="transcript" aria-label="What we have said" tabindex="0"></ol>
       <h1 id="ask" tabindex="-1">What email should I use for your account?</h1>
-      <p id="aside" class="lede">I'm Tuck. I ask one thing at a time. I show you the list before anything goes to Spotify.</p>
+      <p id="aside" class="lede">I'm Tuck. You are helping someone. I ask one thing at a time, including what should stay out. I show you the list before anything goes to Spotify. You can save a private playlist, or take the listening file.</p>
 
-      <form id="form-email">
+      <form id="form-email" class="card">
         <label for="email">Email</label>
         <input id="email" name="email" type="email" autocomplete="username" required maxlength="120" inputmode="email">
         <div class="actions">
@@ -33,14 +34,14 @@
         </div>
       </form>
 
-      <div id="account-choice" hidden>
+      <div id="account-choice" class="card" hidden>
         <div class="actions">
           <button type="button" class="primary" id="choose-new">Make this my account</button>
           <button type="button" class="secondary" id="choose-existing">I have an account</button>
         </div>
       </div>
 
-      <form id="form-password" hidden>
+      <form id="form-password" class="card" hidden>
         <label for="password">Password</label>
         <input id="password" name="password" type="password" autocomplete="new-password" required minlength="10" maxlength="200">
         <p class="hint">At least 10 characters.</p>
@@ -49,7 +50,7 @@
         </div>
       </form>
 
-      <form id="form-who" hidden>
+      <form id="form-who" class="card" hidden>
         <label for="who">Their name</label>
         <input id="who" name="who" type="text" autocomplete="off" required maxlength="60">
         <div class="actions">
@@ -57,7 +58,7 @@
         </div>
       </form>
 
-      <div id="who-choice" hidden>
+      <div id="who-choice" class="card" hidden>
         <div class="actions">
           <button type="button" class="primary" id="who-yes">Yes, still them</button>
           <button type="button" class="secondary" id="who-else">Someone else</button>
@@ -65,7 +66,13 @@
       </div>
 
       <form id="form-answer" hidden>
-        <label for="answer" id="answer-label">Your answer</label>
+        <div id="looking-attach" hidden>
+          <label for="photo">A photo, if you have one</label>
+          <input id="photo" name="photo" type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif" aria-describedby="photo-hint">
+          <p class="hint" id="photo-hint">No photo chosen. I store the file. I do not open it. You can skip the photo.</p>
+          <button type="button" class="secondary" id="looking-skip">Skip the photo</button>
+        </div>
+        <label for="answer" id="answer-label">Your reply</label>
         <textarea id="answer" name="answer" rows="3" maxlength="600"></textarea>
         <div class="actions">
           <button type="button" class="secondary" id="mic" hidden>Speak, then edit</button>
@@ -100,13 +107,13 @@
 
     <details class="advanced">
       <summary>Advanced</summary>
-      <p>A sample family, for a demo. It still stops at the preview until you ask.</p>
+      <p>A sample family. It still stops at the preview until you ask.</p>
       <button type="button" class="secondary" id="sample">Open the sample family</button>
     </details>
 
     <footer class="colophon">
       <p>Most sittings run from about half an hour to two hours. Stop when it stops being easy.</p>
-      <p>This is shared listening. It is not therapy, and it does not treat anything.</p>
+      <p>This is shared listening and looking. It is not therapy, and it does not treat anything.</p>
     </footer>
   </div>
   <noscript>
