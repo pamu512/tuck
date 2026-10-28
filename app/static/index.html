@@ -26,6 +26,8 @@
       <h1 id="ask" tabindex="-1">What email should I use for your account?</h1>
       <p id="aside" class="lede">I'm Tuck. You are helping someone. I ask one thing at a time, including what should stay out. I show you the list before anything goes to Spotify. You can save a private playlist, or take the listening file.</p>
 
+      <section id="cards" hidden aria-label="Suggestions to rate"></section>
+
       <form id="form-email" class="card">
         <label for="email">Email</label>
         <input id="email" name="email" type="email" autocomplete="username" required maxlength="120" inputmode="email">
@@ -72,12 +74,19 @@
           <p class="hint" id="photo-hint">No photo chosen. I store the file. I do not open it. You can skip the photo.</p>
           <button type="button" class="secondary" id="looking-skip">Skip the photo</button>
         </div>
+        <div class="leans" id="leans" hidden>
+          <p class="hint" id="lean-hint">Adding more they love? Pick a lean, then send.</p>
+          <div class="actions" role="group" aria-label="Lean for what you send">
+            <button type="button" class="secondary chip" id="lean-music" aria-pressed="false">Music</button>
+            <button type="button" class="secondary chip" id="lean-film" aria-pressed="false">Film</button>
+            <button type="button" class="secondary chip" id="lean-place" aria-pressed="false">Place</button>
+          </div>
+        </div>
         <label for="answer" id="answer-label">Your reply</label>
         <textarea id="answer" name="answer" rows="3" maxlength="600"></textarea>
         <div class="actions">
           <button type="button" class="secondary" id="mic" hidden>Speak, then edit</button>
           <button class="primary" type="submit" id="send">Send</button>
-          <button type="button" class="secondary" id="exit" hidden>That's enough for a preview</button>
         </div>
       </form>
 

@@ -19,19 +19,10 @@ from app.looking import (
 
 ROOT = Path(__file__).resolve().parents[1]
 PHOTO = b"\xff\xd8\xff\xd9family-photo-bytes"
-SHORT = {
-    "hands": "gardening",
-    "place": "the kitchen",
+CHAT = {
+    "interest": "jazz, Nat King Cole",
     "moment": "Sunday records after lunch.",
-    "music": "jazz",
-    "music_more": "Nat King Cole",
-    "film": "musicals",
-    "film_more": "Singin in the Rain",
-    "when": "late morning",
-    "span": "a few songs",
-    "company": "her daughter",
     "leave_out": "war documentaries",
-    "leave_more": "none",
 }
 
 
@@ -148,39 +139,44 @@ def _open(client):
     return body["session_id"], {"X-Invite-Token": body["invite_token"]}
 
 
-def _until(client, session_id, headers, probe_id):
-    for _ in range(14):
-        view = client.get(f"/sessions/{session_id}/interview", headers=headers)
-        assert view.status_code == 200, view.text
-        body = view.json()
-        if body.get("committed"):
+def _chat_view(client, session_id, headers):
+    view = client.get(f"/sessions/{session_id}/interview", headers=headers)
+    assert view.status_code == 200, view.text
+    return view.json()
+
+
+def _answer_slot(client, session_id, headers, body):
+    turned = client.post(
+        f"/sessions/{session_id}/interview",
+        json={"text": CHAT[body["slot"]]},
+        headers=headers,
+    )
+    assert turned.status_code == 200, turned.text
+    return turned.json()
+
+
+def _until(client, session_id, headers, slot):
+    """Answer chat turns until the sitting is asking for `slot`."""
+    for _ in range(6):
+        body = _chat_view(client, session_id, headers)
+        if body.get("committed") or body.get("phase") != "chat":
             return body
-        probe = body.get("probe") or {}
-        if probe.get("id") == probe_id:
+        if body.get("slot") == slot:
             return body
-        turned = client.post(
-            f"/sessions/{session_id}/interview",
-            json={"text": SHORT[probe["id"]]},
-            headers=headers,
-        )
-        assert turned.status_code == 200, turned.text
-    raise AssertionError("interview did not reach " + probe_id)
+        _answer_slot(client, session_id, headers, body)
+    raise AssertionError("interview did not reach " + slot)
 
 
 def _finish(client, session_id, headers):
-    for _ in range(14):
-        view = client.get(f"/sessions/{session_id}/interview", headers=headers)
-        assert view.status_code == 200, view.text
-        body = view.json()
+    """Answer every chat turn until the sitting commits to the preview."""
+    for _ in range(6):
+        body = _chat_view(client, session_id, headers)
         if body.get("committed") or body.get("phase") == "preview":
             return body
-        probe = body.get("probe") or {}
-        turned = client.post(
-            f"/sessions/{session_id}/interview",
-            json={"text": SHORT[probe["id"]]},
-            headers=headers,
-        )
-        assert turned.status_code == 200, turned.text
+        if body.get("phase") == "chat" and body.get("slot"):
+            _answer_slot(client, session_id, headers, body)
+            continue
+        raise AssertionError("interview stalled in phase " + str(body.get("phase")))
     raise AssertionError("interview did not finish")
 
 
@@ -250,7 +246,7 @@ def test_multipart_upload_stores_an_opaque_data_path(client, fake_qloo):
     session = client.app.state.store.get(session_id)
     blob = json.dumps(session)
     assert "kitchen.jpg" not in blob
-    assert session["interview"]["answers"]["moment"] == "Sunday records after lunch."
+    assert session["interview"]["moment"] == "Sunday records after lunch."
     assert session["interview"]["photo_path"] == body["photo_href"]
     account = client.app.state.accounts.get(session["account_id"])
     moment = next(item for item in account["profile"]["probes"] if item["id"] == "moment")
@@ -431,7 +427,7 @@ def test_moment_can_skip_the_photo(client, fake_qloo):
     assert fake_qloo.calls == before
     assert list(client.app.state.photo_dir.iterdir()) == []
     session = client.app.state.store.get(session_id)
-    assert session["interview"]["answers"]["moment"] == "Sunday records after lunch."
+    assert session["interview"]["moment"] == "Sunday records after lunch."
     assert str(session["interview"].get("photo_path") or "") in ("", "not-provided")
 
 
@@ -570,7 +566,7 @@ def test_failed_moment_save_does_not_record_the_account(client, monkeypatch):
     assert saved.status_code == 503
     monkeypatch.undo()
     session = client.app.state.store.get(session_id)
-    assert "moment" not in (session.get("interview") or {}).get("answers", {})
+    assert not (session.get("interview") or {}).get("moment")
     after = [
         item.get("id")
         for item in (client.app.state.accounts.get(account_id).get("profile") or {}).get("probes") or []

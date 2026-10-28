@@ -243,11 +243,13 @@ def write_person_name(account: dict[str, Any], person_name: str) -> None:
     profile["person_name"] = person_name
 
 
-def write_probe(account: dict[str, Any], probe: dict[str, str]) -> None:
+def write_turn(account: dict[str, Any], turn: dict[str, str]) -> None:
+    """Append one chat turn to the durable profile. Last 60 kept."""
     profile = account.setdefault("profile", fresh_profile())
-    probes = [item for item in profile.get("probes") or [] if item.get("id") != probe["id"]]
-    probes.append(probe)
-    profile["probes"] = probes
+    turns = [item for item in profile.get("probes") or [] if isinstance(item, dict)]
+    turns.append({**turn, "chat": True})
+    # ponytail: caps the profile row. Upgrade path: a log file per account.
+    profile["probes"] = turns[-60:]
 
 
 def write_commit(account: dict[str, Any], *, habits: list[dict[str, str]], exclusions: list[str]) -> None:

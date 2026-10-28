@@ -17,7 +17,8 @@ const state = {
   personName: "",
   sessionId: null,
   token: null,
-  probeId: null,
+  slot: null,
+  lean: null,
   feedbackId: null,
   busy: false,
 };
@@ -151,6 +152,75 @@ function clearTranscript() {
   if (list) list.replaceChildren();
 }
 
+const KIND_LABELS = { music: "music", film: "film", place: "place", thing: "a thing they love" };
+
+function rateReply(card, score) {
+  if (score >= 4) return `Kept. ${card.name} shapes what I ask for next.`;
+  if (score <= 2) return `Noted. I will steer away from ${card.name}. Nothing was added to what stays out.`;
+  return `Noted. ${card.name} stays where it is.`;
+}
+
+function renderCards(view) {
+  const host = document.getElementById("cards");
+  if (!host) return;
+  host.replaceChildren();
+  const cards = (view && view.cards) || [];
+  if (!cards.length) {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+  if (view.rate_hint) add(host, "p", view.rate_hint, "rate-hint");
+  if (view.card_note) add(host, "p", view.card_note, "card-note");
+  const list = add(host, "ul", null, "suggestions");
+  cards.forEach((card) => {
+    if (!card || !card.card_id) return;
+    const item = add(list, "li", null, "suggestion");
+    add(item, "p", card.name || "", "suggestion-name");
+    if (card.why) add(item, "p", card.why, "why");
+    const kind = KIND_LABELS[card.kind] || card.kind || "";
+    if (kind) add(item, "p", `A ${kind} suggestion.`, "meta");
+    const field = document.createElement("fieldset");
+    field.className = "rate";
+    const legend = document.createElement("legend");
+    legend.textContent = `Rate ${card.name || "this"} from 1 to 5`;
+    field.appendChild(legend);
+    const row = add(field, "div", null, "rate-row");
+    for (let score = 1; score <= 5; score += 1) {
+      const id = `rate-${card.card_id}-${score}`;
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = `rate-${card.card_id}`;
+      input.value = String(score);
+      input.id = id;
+      const label = document.createElement("label");
+      label.htmlFor = id;
+      label.textContent = String(score);
+      row.append(input, label);
+    }
+    field.addEventListener("change", (event) => rateCard(card, Number(event.target.value)));
+    item.appendChild(field);
+  });
+  list.scrollTop = list.scrollHeight;
+}
+
+async function rateCard(card, score) {
+  if (state.busy || !state.sessionId) return;
+  setBusy(true);
+  try {
+    const saved = await api(`/sessions/${state.sessionId}/ratings`, {
+      method: "POST",
+      token: state.token,
+      body: { card_id: card.card_id, score },
+    });
+    setStatus((saved && saved.reply) || rateReply(card, score));
+  } catch (err) {
+    setError(err.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 function renderTranscript(view) {
   const list = document.getElementById("transcript");
   if (!list) return;
@@ -238,10 +308,21 @@ function focusAsk() {
   else askEl.focus();
 }
 
+function hideCards() {
+  const host = document.getElementById("cards");
+  if (host) {
+    host.hidden = true;
+    host.replaceChildren();
+  }
+}
+
 function showAsk(text, panel) {
   askEl.textContent = text;
   hideAll();
-  if (panel === forms.email) clearTranscript();
+  if (panel === forms.email) {
+    clearTranscript();
+    hideCards();
+  }
   if (panel) panel.hidden = false;
   setError("");
   focusAsk();
@@ -257,7 +338,8 @@ function rememberSession(sessionId, token) {
 function clearSession() {
   state.sessionId = null;
   state.token = null;
-  state.probeId = null;
+  state.slot = null;
+  state.lean = null;
   state.feedbackId = null;
   sessionStorage.removeItem("tuck_session");
   sessionStorage.removeItem("tuck_token");
@@ -288,26 +370,49 @@ async function openSitting(name) {
   await showInterview();
 }
 
+function setLean(lean) {
+  state.lean = lean;
+  ["music", "film", "place"].forEach((kind) => {
+    const chip = document.getElementById(`lean-${kind}`);
+    if (chip) chip.setAttribute("aria-pressed", lean === kind ? "true" : "false");
+  });
+}
+
+["music", "film", "place"].forEach((kind) => {
+  const chip = document.getElementById(`lean-${kind}`);
+  if (chip) {
+    chip.addEventListener("click", () => {
+      setLean(state.lean === kind ? null : kind);
+    });
+  }
+});
+
 async function showInterview() {
   const view = await api(`/sessions/${state.sessionId}/interview`, { token: state.token });
   renderTranscript(view);
+  renderCards(view);
   asideEl.hidden = true;
   signOut.hidden = false;
   const attach = document.getElementById("looking-attach");
-  if (view.phase === "probe" && view.probe) {
-    state.probeId = view.probe.id;
-    if (attach) attach.hidden = view.probe.id !== "moment";
-    if (view.probe.id === "moment") document.getElementById("photo").value = "";
+  const leans = document.getElementById("leans");
+  if (view.phase === "chat") {
+    state.slot = view.slot;
+    if (attach) attach.hidden = view.slot !== "moment";
+    if (view.slot === "moment") document.getElementById("photo").value = "";
+    if (leans) leans.hidden = false;
     showAsk(view.asked, forms.answer);
-    document.getElementById("exit").hidden = !view.can_exit;
     document.getElementById("answer").value = "";
-    if (view.probe.id === "moment") syncLookingSend();
+    if (view.slot === "moment") syncLookingSend();
     return;
   }
-  state.probeId = null;
+  state.slot = null;
+  setLean(null);
   if (attach) attach.hidden = true;
+  if (leans) leans.hidden = true;
   if (view.phase === "preview") {
     showAsk(view.asked, forms.previewActions);
+    // The chat keeps going: more names can still be sent.
+    forms.answer.hidden = false;
     return;
   }
   if (view.phase === "list") {
@@ -466,6 +571,7 @@ function trackTitle(track) {
 
 async function showGift() {
   setStatus("Opening the listening gift.");
+  hideCards();
   const plan = await api(`/sessions/${state.sessionId}/export`, { token: state.token });
   const label = plan.caregiver_label || state.personName || "them";
   showAsk(`Listening for ${label}.`, forms.gift);
@@ -769,13 +875,19 @@ async function sendReply(raw, { skipPhoto = false } = {}) {
   setBusy(true);
   setStatus(looking ? "Saving that moment." : "Saving that.");
   try {
+    const body = { text };
+    if (state.lean) {
+      body.lean = state.lean;
+      body.slot = "interest";
+    }
     await api(`/sessions/${state.sessionId}/interview`, {
       method: "POST",
       token: state.token,
-      body: { text },
+      body,
     });
     if (input) input.value = "";
     document.getElementById("answer").value = "";
+    setLean(null);
     await showInterview();
     setStatus("");
   } catch (err) {
@@ -797,25 +909,6 @@ document.getElementById("looking-skip").addEventListener("click", () => {
 forms.answer.addEventListener("submit", (event) => {
   event.preventDefault();
   sendReply(document.getElementById("answer").value);
-});
-
-document.getElementById("exit").addEventListener("click", async () => {
-  setBusy(true);
-  setStatus("Stopping here.");
-  try {
-    await api(`/sessions/${state.sessionId}/interview`, {
-      method: "POST",
-      token: state.token,
-      body: { exit: true },
-    });
-    await showInterview();
-    setStatus("");
-  } catch (err) {
-    setError(err.message);
-    setStatus("");
-  } finally {
-    setBusy(false);
-  }
 });
 
 document.getElementById("build-preview").addEventListener("click", async () => {

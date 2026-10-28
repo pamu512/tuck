@@ -15,6 +15,7 @@ unauthenticated session, and it only loads the canned sample family.
     POST   /invites
     GET    /sessions/{id}/interview
     POST   /sessions/{id}/interview
+    POST   /sessions/{id}/ratings
     POST   /sessions/{id}/feedback
     POST   /sessions/{id}/uploads
     POST   /sessions/{id}/data
@@ -68,7 +69,7 @@ from .accounts import (
     write_commit,
     write_feedback,
     write_person_name,
-    write_probe,
+    write_turn,
 )
 from .agent import (
     assert_candidates,
@@ -91,19 +92,34 @@ from .playlist import (
     uris_to_add,
 )
 from .interview import (
+    ASKS,
     FEEDBACK,
-    persona_summary,
+    LEAN_KINDS,
+    LOCAL_CARD_MIN,
     NO_PHOTO,
-    PROBES,
-    PROBES_BY_ID,
+    SLOT_INTEREST,
+    SLOT_LEAVE_OUT,
+    SLOT_MOMENT,
     acknowledge,
     apply_looking_photo,
-    can_exit,
+    chat_signal_ids,
     fresh_interview,
+    local_cards,
     materialize,
-    next_probe,
+    next_insight_urn,
+    next_slot,
+    normalize_interview,
     pending_feedback,
-    validate_answer,
+    persona_summary,
+    phrases_of,
+    preview_ready,
+    qloo_cards,
+    rating_effects,
+    record_rating,
+    store_interest_turn,
+    validate_interest_text,
+    validate_leave_out_text,
+    validate_moment_text,
 )
 from .looking import (
     PHOTO_ID_RE,
@@ -116,7 +132,7 @@ from .looking import (
     session_photo_media,
     store_opaque,
 )
-from .qloo import INSIGHT_TYPES, QlooAuthError, QlooClient, QlooUpstreamError
+from .qloo import INSIGHT_TYPES, QlooAuthError, QlooClient, QlooError, QlooUpstreamError
 from .sample import SAMPLE
 from .store import JsonStore, StoreError
 
@@ -197,7 +213,13 @@ class GuideRequest(BaseModel):
 
 class InterviewTurn(BaseModel):
     text: str | None = None
-    exit: bool = False
+    lean: Literal["music", "film", "place"] | None = None
+    slot: Literal["interest", "moment", "leave_out"] | None = None
+
+
+class RatingTurn(BaseModel):
+    card_id: str = Field(min_length=3, max_length=40)
+    score: int = Field(ge=1, le=5)
 
 
 class FeedbackTurn(BaseModel):
@@ -344,41 +366,82 @@ def create_app(
         session["interview"] = fresh_interview()
         session["feedback"] = {}
 
+    def chat_cards(session: dict[str, Any], state: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+        """Cards for the sitting right now.
+
+        Local until exclusions are acknowledged and the preview is signed;
+        then one GET /v2/insights call, exclusion-filtered, ratings applied.
+        A Qloo failure degrades to local cards; it never fails the reply.
+        """
+        gate_open = (
+            session.get("previewed_at")
+            and session.get("exclusions_acknowledged_at")
+            and not session.get("sealed")
+        )
+        if gate_open:
+            tag_ids, entity_ids = chat_signal_ids(session)
+            if tag_ids or entity_ids:
+                try:
+                    qloo = get_qloo()
+                    entities = qloo.insights(
+                        entity_type=next_insight_urn(session),
+                        signal_tags=tag_ids,
+                        signal_entities=entity_ids,
+                        take=8,
+                    )
+                except (QlooAuthError, QlooUpstreamError, QlooError):
+                    return local_cards(state), (
+                        "I could not reach the suggestion service, so these are "
+                        "still from your own words."
+                    )
+                cards = qloo_cards(session, entities)
+                if cards:
+                    # Thin Qloo results never break the 2-5 card promise.
+                    if len(cards) < LOCAL_CARD_MIN:
+                        seen = {card["card_id"] for card in cards}
+                        for card in local_cards(state):
+                            if len(cards) >= LOCAL_CARD_MIN:
+                                break
+                            if card["card_id"] not in seen:
+                                cards.append(card)
+                    return cards, None
+        return local_cards(state), None
+
     def interview_view(session: dict[str, Any]) -> dict[str, Any]:
         interview = session.get("interview") or fresh_interview()
-        answers = dict(interview.get("answers") or {})
-        exited = bool(interview.get("exited"))
-        committed = bool(interview.get("committed"))
-        probe = None if committed else next_probe(answers, exited)
+        state = normalize_interview(interview)
+        committed = bool(state.get("committed"))
+        slot = None if committed else next_slot(state)
         pending = pending_feedback(session.get("feedback")) if session.get("sealed") else None
+        label = session.get("caregiver_label") or "them"
         if session.get("sealed"):
             phase = "gift"
-            asked = f"Listening for {session.get('caregiver_label') or 'them'}."
+            asked = f"Listening for {label}."
         elif session.get("previewed_at"):
             phase = "list"
             asked = "The preview is signed. Ask for the list when you are ready."
         elif committed:
             phase = "preview"
             asked = "I can build the preview from what you told me. Nothing is requested until you say so."
-        elif probe:
-            phase = "probe"
-            asked = probe["ask"]
         else:
-            phase = "preview"
-            asked = "I can build the preview from what you told me. Nothing is requested until you say so."
+            phase = "chat"
+            asked = ASKS[slot or SLOT_INTEREST]
         turns: list[dict[str, str]] = []
-        for item in PROBES:
-            text = answers.get(item["id"])
-            if text is None:
-                continue
-            turns.append({"id": item["id"], "ask": item["ask"], "answer": str(text)})
+        phrases = phrases_of(state)
+        if phrases:
+            turns.append({"id": SLOT_INTEREST, "ask": ASKS[SLOT_INTEREST], "answer": ", ".join(phrases)})
+        moment = str(state.get("moment") or "").strip()
+        if moment:
+            turns.append({"id": SLOT_MOMENT, "ask": ASKS[SLOT_MOMENT], "answer": moment})
+        if state.get("leave_out") is not None:
+            turns.append({"id": SLOT_LEAVE_OUT, "ask": ASKS[SLOT_LEAVE_OUT], "answer": str(state.get("leave_out"))})
         if session.get("sealed"):
             saved_feedback = session.get("feedback") or {}
             for item in FEEDBACK:
                 text = str(saved_feedback.get(item["id"]) or "").strip()
                 if text:
                     turns.append({"id": item["id"], "ask": item["ask"], "answer": text})
-        if phase in ("probe", "preview") and turns:
+        if phase in ("chat", "preview") and turns:
             heard = acknowledge(turns[-1]["answer"])
             if heard:
                 asked = f"{heard} {asked}"
@@ -392,15 +455,18 @@ def create_app(
             if href.startswith("/data/") and photo_provided(href):
                 attached = True
                 break
+        cards, card_note = chat_cards(session, state)
         return {
             "phase": phase,
             "asked": asked,
-            "probe": (
-                {"id": probe["id"], "topic": probe["topic"], "ask": probe["ask"]} if probe else None
-            ),
-            "can_exit": bool(probe) and can_exit(answers, exited) and not committed,
+            "slot": slot if phase == "chat" else None,
+            "ask": ASKS[slot] if (phase == "chat" and slot) else None,
+            "reply": acknowledge(turns[-1]["answer"]) if (phase in ("chat", "preview") and turns) else "",
+            "cards": cards,
+            "card_note": card_note,
+            "rate_hint": "Rate any suggestion 1 to 5 to tighten what I ask for next.",
+            "can_preview": committed or preview_ready(state),
             "committed": committed,
-            "answer_count": len(answers),
             "turns": turns,
             "photo_attached": attached,
             "caregiver_label": session.get("caregiver_label") or "",
@@ -408,14 +474,18 @@ def create_app(
             "feedback_ask": pending["ask"] if pending else None,
         }
 
+    def sync_cards(session: dict[str, Any], view: dict[str, Any]) -> None:
+        """Cache the served cards so a rating can find its content."""
+        if session.get("cards") != view.get("cards"):
+            session["cards"] = view.get("cards") or []
+            store.put(session)
+
     def commit_interview(session: dict[str, Any]) -> None:
         interview = session.setdefault("interview", fresh_interview())
         if interview.get("committed"):
             return
-        built = materialize(
-            dict(interview.get("answers") or {}),
-            photo_path=str(interview.get("photo_path") or NO_PHOTO),
-        )
+        state = normalize_interview(interview)
+        built = materialize(state, photo_path=str(state.get("photo_path") or NO_PHOTO))
         if not built["anecdote"]:
             raise HTTPException(status_code=409, detail="I still need one moment in your words.")
         if not built["interests"]:
@@ -423,7 +493,7 @@ def create_app(
                 status_code=409,
                 detail="I still need a singer, a film, or something they like, in a few words.",
             )
-        if "leave_out" not in (interview.get("answers") or {}):
+        if not preview_ready(state):
             raise HTTPException(status_code=409, detail="Tell me what should stay out before the preview.")
         try:
             domain.require_open(session)
@@ -435,7 +505,7 @@ def create_app(
                     interests=built["interests"],
                 ),
             )
-            media = interview.get("photo_type")
+            media = state.get("photo_type")
             if media:
                 upload["photo_type"] = media
             exclusions = domain.acknowledge_exclusions(
@@ -447,6 +517,7 @@ def create_app(
         except domain.SessionError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         warning = resolve_saved_exclusions(exclusions, get_qloo)
+        interview.update(state)
         interview["committed"] = True
         interview["resolution_warning"] = warning
         account_id = session.get("account_id")
@@ -738,8 +809,16 @@ def create_app(
             )
         except domain.SessionError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-        session["interview"]["committed"] = True
-        session["interview"]["answers"] = {"leave_out": "war documentaries"}
+        session["interview"] = {
+            **fresh_interview(),
+            "interests": [
+                {"phrase": str(phrase), "lean": "", "at": ""}
+                for phrase in SAMPLE["interests"]
+            ],
+            "moment": SAMPLE["anecdote"],
+            "leave_out": "war documentaries",
+            "committed": True,
+        }
         insert_session(session)
         return {
             "session_id": session["id"],
@@ -772,7 +851,9 @@ def create_app(
     ) -> dict[str, Any]:
         with store.session_scope(session_id):
             session = load_session(session_id, x_invite_token, request)
-            return interview_view(session)
+            view = interview_view(session)
+            sync_cards(session, view)
+            return view
 
     @app.post("/sessions/{session_id}/interview")
     def post_interview(
@@ -788,46 +869,119 @@ def create_app(
             except domain.SessionError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
             interview = session.setdefault("interview", fresh_interview())
-            if interview.get("committed"):
-                raise HTTPException(status_code=409, detail="The preview is already waiting.")
-            answers = dict(interview.get("answers") or {})
-            exited = bool(interview.get("exited"))
-            if turn.exit:
-                if not can_exit(answers, exited):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Stay for a few more questions. I can stop once the picture is clear.",
-                    )
-                interview["exited"] = True
-                exited = True
+            state = normalize_interview(interview)
+            committed = bool(state.get("committed"))
+            text = " ".join((turn.text or "").split())
+            if turn.slot == SLOT_LEAVE_OUT and committed:
+                raise HTTPException(
+                    status_code=409,
+                    detail="What stays out is already saved with the preview. Use the exclusions step to change it.",
+                )
+            if turn.slot == SLOT_MOMENT and committed:
+                raise HTTPException(
+                    status_code=409,
+                    detail="That moment is saved with the sitting. Start a new sitting to tell a different one.",
+                )
+            if turn.slot is not None:
+                slot = turn.slot
+            elif committed:
+                slot = SLOT_INTEREST
             else:
-                probe = next_probe(answers, exited)
-                if probe is None:
-                    raise HTTPException(status_code=409, detail="There is no question waiting.")
-                try:
-                    text = validate_answer(probe, turn.text or "")
-                except ValueError as exc:
-                    raise HTTPException(status_code=422, detail=str(exc)) from exc
-                answers[probe["id"]] = text
-                interview["answers"] = answers
-                account_id = session.get("account_id")
-                if account_id:
-                    account = accounts.get(account_id)
-                    if account:
-                        write_probe(
-                            account,
-                            {
-                                "id": probe["id"],
-                                "topic": probe["topic"],
-                                "prompt": probe["ask"],
-                                "answer": text,
-                            },
-                        )
-                        save_account(account)
-            if next_probe(dict(interview.get("answers") or {}), bool(interview.get("exited"))) is None:
+                slot = next_slot(state) or SLOT_INTEREST
+            if committed and not text and slot == SLOT_INTEREST:
+                # A bare ping after the preview: fresh cards, no stored turn.
+                view = interview_view(session)
+                view["reply"] = "Here are more suggestions."
+                sync_cards(session, view)
+                return view
+            try:
+                if slot == SLOT_INTEREST:
+                    stored = validate_interest_text(text)
+                    store_interest_turn(state, stored, turn.lean, domain.now_utc())
+                elif slot == SLOT_MOMENT:
+                    stored = validate_moment_text(text)
+                    state["moment"] = stored
+                else:
+                    stored = validate_leave_out_text(text)
+                    state["leave_out"] = stored
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            interview.update(state)
+            account_id = session.get("account_id")
+            if account_id:
+                account = accounts.get(account_id)
+                if account:
+                    write_turn(
+                        account,
+                        {
+                            "id": slot,
+                            "topic": slot,
+                            "prompt": ASKS[slot],
+                            "answer": stored,
+                            "lean": turn.lean or "",
+                        },
+                    )
+                    save_account(account)
+            if not committed and preview_ready(state):
                 commit_interview(session)
             store.put(session)
-            return interview_view(session)
+            view = interview_view(session)
+            sync_cards(session, view)
+            return view
+
+    @app.post("/sessions/{session_id}/ratings")
+    def post_rating(
+        session_id: str,
+        turn: RatingTurn,
+        request: Request,
+        x_invite_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        with store.session_scope(session_id):
+            session = load_session(session_id, x_invite_token, request)
+            if session.get("sealed"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="The listening gift is sealed. Start a new sitting to keep shaping it.",
+                )
+            card = next(
+                (
+                    item
+                    for item in session.get("cards") or []
+                    if isinstance(item, dict) and item.get("card_id") == turn.card_id
+                ),
+                None,
+            )
+            if card is None:
+                # Local cards are rebuilt from state; their ids are deterministic.
+                state = normalize_interview(session.get("interview"))
+                card = next(
+                    (item for item in local_cards(state) if item.get("card_id") == turn.card_id),
+                    None,
+                )
+            if card is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="That suggestion is not on the desk right now.",
+                )
+            entry = record_rating(session, card, turn.score, domain.now_utc())
+            store.put(session)
+            if turn.score >= 4:
+                reply = (
+                    f"Kept. {entry['name']} goes into what I ask for next."
+                    if card.get("source") == "qloo"
+                    else f"Kept. {entry['name']} stays in what I ask for next."
+                )
+            elif turn.score <= 2:
+                reply = f"Noted. I will steer away from {entry['name']}. Nothing was added to what stays out."
+            else:
+                reply = f"Noted. {entry['name']} stays where it is."
+            return {
+                "stored": True,
+                "card_id": turn.card_id,
+                "score": turn.score,
+                "reply": reply,
+                "leans": rating_effects(session)["leans"],
+            }
 
     @app.post("/sessions/{session_id}/feedback")
     def post_feedback(
@@ -914,11 +1068,10 @@ def create_app(
             except domain.SessionError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
             interview = session.setdefault("interview", fresh_interview())
-            if interview.get("committed"):
+            state = normalize_interview(interview)
+            if state.get("committed"):
                 return interview
-            answers = dict(interview.get("answers") or {})
-            probe = next_probe(answers, bool(interview.get("exited")))
-            if probe is None or probe["id"] != "moment":
+            if next_slot(state) != SLOT_MOMENT:
                 raise HTTPException(
                     status_code=409,
                     detail="Tell me the moment when I ask for it.",
@@ -936,7 +1089,7 @@ def create_app(
             if photo is None:
                 raise HTTPException(status_code=422, detail="Choose a photo to look at.")
             try:
-                text = validate_answer(PROBES_BY_ID["moment"], anecdote)
+                text = validate_moment_text(anecdote)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             with store.session_scope(session_id):
@@ -951,15 +1104,10 @@ def create_app(
                 with store.session_scope(session_id):
                     session = load_session(session_id, x_invite_token, http_request)
                     interview = ensure_looking_turn(session)
-                    pending_probe = None
                     if not interview.get("committed"):
-                        answers = dict(interview.get("answers") or {})
-                        exited = bool(interview.get("exited"))
-                        probe = next_probe(answers, exited)
-                        answers["moment"] = text
-                        interview["answers"] = answers
-                        if probe is not None:
-                            pending_probe = probe
+                        state = normalize_interview(interview)
+                        state["moment"] = text
+                        interview.update(state)
                     previous = str(interview.get("photo_path") or "")
                     try:
                         photo_id = allocate_photo_id(app.state.photo_dir)
@@ -970,10 +1118,7 @@ def create_app(
                     stored_href = href
                     apply_looking_photo(session, href=href, media_type=media, anecdote=text)
                     if not interview.get("committed"):
-                        if next_probe(
-                            dict(interview.get("answers") or {}),
-                            bool(interview.get("exited")),
-                        ) is None:
+                        if preview_ready(normalize_interview(interview)):
                             commit_interview(session)
                     try:
                         store.put(session)
@@ -983,22 +1128,22 @@ def create_app(
                             detail="I could not store that photo. Try again.",
                         ) from exc
                     saved = True
-                    if pending_probe is not None:
-                        account_id = session.get("account_id")
-                        if account_id:
-                            account = accounts.get(account_id)
-                            if account:
-                                write_probe(
-                                    account,
-                                    {
-                                        "id": pending_probe["id"],
-                                        "topic": pending_probe["topic"],
-                                        "prompt": pending_probe["ask"],
-                                        "answer": text,
-                                    },
-                                )
-                                save_account(account)
+                    account_id = session.get("account_id")
+                    if account_id:
+                        account = accounts.get(account_id)
+                        if account:
+                            write_turn(
+                                account,
+                                {
+                                    "id": SLOT_MOMENT,
+                                    "topic": SLOT_MOMENT,
+                                    "prompt": ASKS[SLOT_MOMENT],
+                                    "answer": text,
+                                },
+                            )
+                            save_account(account)
                     body = interview_view(session)
+                    sync_cards(session, body)
                     body["photo_href"] = href
                     body["photo_on_file"] = True
                     body["anecdote_chars"] = len(text)
@@ -1205,13 +1350,12 @@ def create_app(
                     ),
                 )
             kept_signals, _ = domain.split_signals(signals, session["exclusions"] or [])
-            if not kept_signals:
+            tag_ids, entity_ids = chat_signal_ids(session)
+            if not tag_ids and not entity_ids:
                 raise HTTPException(
                     status_code=409,
                     detail="All interest signals are withheld by exclusions; nothing will be requested from Qloo.",
                 )
-            tag_ids = [signal["id"] for signal in kept_signals if signal["kind"] == "tag"]
-            entity_ids = [signal["id"] for signal in kept_signals if signal["kind"] == "entity"]
 
             collected: list[dict[str, Any]] = []
             types_failed: list[dict[str, Any]] = []

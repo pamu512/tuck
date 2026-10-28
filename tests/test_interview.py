@@ -1,94 +1,270 @@
-"""Account first, then probes, then the existing preview gate."""
+"""Account first, then the chat: reply plus cards, ratings, preview gate."""
 
 import json
 
 from app.interview import (
     acknowledge,
-    can_exit,
+    fresh_interview,
     materialize,
-    next_probe,
+    next_slot,
+    normalize_interview,
     persona_summary,
+    preview_ready,
     soft_normalize_interest,
+    store_interest_turn,
 )
 from app.session import candidate_reason, resolve_signals
 
 
-def _short_answers():
-    return {
-        "hands": "gardening",
-        "place": "the kitchen",
-        "moment": "Sunday records after lunch.",
-        "music": "jazz",
-        "music_more": "Nat King Cole",
-        "film": "musicals",
-        "film_more": "Singin in the Rain",
-        "when": "late morning",
-        "span": "a few songs",
-        "company": "her daughter",
-        "leave_out": "war documentaries",
-        "leave_more": "none",
-    }
-
-
-def test_full_path_asks_eight_to_twelve_probes():
-    answers = {}
-    asked = []
-    samples = _short_answers()
-    while True:
-        probe = next_probe(answers, False)
-        if probe is None:
-            break
-        asked.append(probe["id"])
-        answers[probe["id"]] = samples[probe["id"]]
-        assert len(asked) <= 12
-    assert 8 <= len(asked) <= 12
-    assert asked[0] == "hands"
-    assert "moment" in asked and "music" in asked and "film" in asked
-    assert "leave_out" in asked
-
-
-def test_early_exit_still_asks_what_stays_out():
-    answers = {}
-    exited = False
-    asked = []
-    while True:
-        probe = next_probe(answers, exited)
-        if probe is None:
-            break
-        asked.append(probe["id"])
-        answers[probe["id"]] = _short_answers()[probe["id"]]
-        if can_exit(answers, exited):
-            exited = True
-    assert "leave_out" in asked
-    assert "span" not in asked
-    assert len(asked) < 12
-
-
-def test_none_is_not_stored_as_an_interest_or_an_exclusion():
-    built = materialize(
-        {
-            "moment": "Sunday records after lunch.",
-            "hands": "gardening",
-            "music": "jazz",
-            "film": "musicals",
-            "place": "none",
-            "leave_out": "none",
-        }
+def _open(client, email):
+    created = client.post(
+        "/accounts",
+        json={"email": email, "password": "test-password-1"},
     )
-    # Music/film answers are retained ahead of hobby probes.
-    assert built["interests"] == ["jazz", "musicals", "gardening"]
+    assert created.status_code == 201, created.text
+    invite = client.post("/invites", json={"caregiver_label": "Ada"})
+    assert invite.status_code == 201, invite.text
+    body = invite.json()
+    return body["session_id"], {"X-Invite-Token": body["invite_token"]}
+
+
+def _get(client, session_id, headers):
+    view = client.get(f"/sessions/{session_id}/interview", headers=headers)
+    assert view.status_code == 200, view.text
+    return view.json()
+
+
+def _say(client, session_id, headers, text, **extra):
+    turned = client.post(
+        f"/sessions/{session_id}/interview",
+        json={"text": text, **extra},
+        headers=headers,
+    )
+    assert turned.status_code == 200, turned.text
+    return turned.json()
+
+
+def _drive_to_preview(client, session_id, headers, *, moment="Sunday records after lunch."):
+    """Three chat turns: interest, moment, leave_out. Returns the committed view."""
+    _say(client, session_id, headers, "jazz", lean="music")
+    _say(client, session_id, headers, moment)
+    return _say(client, session_id, headers, "war documentaries")
+
+
+def test_preview_unlocks_on_interest_moment_and_leave_out():
+    state = fresh_interview()
+    assert next_slot(state) == "interest"
+    assert not preview_ready(state)
+    store_interest_turn(state, "jazz", "music", "t1")
+    assert next_slot(state) == "moment"
+    assert not preview_ready(state)
+    state["moment"] = "Sunday records after lunch."
+    assert next_slot(state) == "leave_out"
+    assert not preview_ready(state)
+    state["leave_out"] = "none"
+    assert next_slot(state) is None
+    assert preview_ready(state)
+
+
+def test_none_leave_out_counts_as_answered_not_as_exclusion():
+    state = fresh_interview()
+    store_interest_turn(state, "jazz", "music", "t1")
+    state["moment"] = "Sunday records after lunch."
+    state["leave_out"] = "none"
+    built = materialize(state)
     assert built["exclusions"] == []
+    assert built["interests"] == ["jazz"]
     assert built["photo_path"] == "not-provided"
     assert "Sunday" in built["anecdote"]
 
 
-def test_invites_require_an_account(client):
-    response = client.post("/invites", json={"caregiver_label": "Ada"})
-    assert response.status_code == 401
-    assert "password" not in response.text.lower()
+def test_every_interview_response_carries_a_reply_and_cards(client):
+    session_id, headers = _open(client, "cards@example.com")
+    view = _get(client, session_id, headers)
+    assert view["phase"] == "chat"
+    assert view["slot"] == "interest"
+    assert isinstance(view["reply"], str)
+    assert 2 <= len(view["cards"]) <= 5
+    assert view["rate_hint"]
+    for card in view["cards"]:
+        assert card["source"] == "local"
+        assert card["card_id"]
+        assert card["name"]
+        assert card["why"]
+
+    turned = _say(client, session_id, headers, "jazz", lean="music")
+    assert turned["reply"].startswith("I'll keep")
+    assert 2 <= len(turned["cards"]) <= 5
+    assert turned["cards"][0]["phrase"] == "jazz"
+    assert turned["slot"] == "moment"
+
+    turned = _say(client, session_id, headers, "Sunday records after lunch.")
+    assert 2 <= len(turned["cards"]) <= 5
+    assert turned["slot"] == "leave_out"
 
 
-def test_interview_commits_without_insights_and_stores_feedback(client, fake_qloo):
+def test_local_cards_until_leave_out_then_no_insights_before_the_preview(client, fake_qloo):
+    session_id, headers = _open(client, "gate@example.com")
+    committed = _drive_to_preview(client, session_id, headers)
+    assert committed["committed"] is True
+    assert committed["phase"] == "preview"
+    assert committed["can_preview"] is True
+    # The whole chat ran on local cards; Qloo insights never fired.
+    assert not any(call[0] == "insights" for call in fake_qloo.calls)
+    for card in committed["cards"]:
+        assert card["source"] == "local"
+
+    # Acknowledged exclusions alone do not open the card gate.
+    between = _get(client, session_id, headers)
+    assert between["phase"] == "preview"
+    for card in between["cards"]:
+        assert card["source"] == "local"
+    assert not any(call[0] == "insights" for call in fake_qloo.calls)
+
+    preview = client.post(f"/sessions/{session_id}/preview", headers=headers)
+    assert preview.status_code == 200, preview.text
+    assert "war documentaries" in json.dumps(preview.json())
+
+    after = _get(client, session_id, headers)
+    assert after["phase"] == "list"
+    assert after["cards"]
+    for card in after["cards"]:
+        assert card["source"] == "qloo"
+        assert card["entity_id"]
+        assert card["phrase"] is None
+    assert any(call[0] == "insights" for call in fake_qloo.calls)
+
+
+def test_qloo_cards_carry_no_biography_and_respect_exclusions(client, fake_qloo):
+    fake_qloo.catalog["urn:entity:artist"] = [
+        {"entity_id": "A-9", "name": "World War II Documentary Collection", "subtype": "urn:entity:artist", "image_url": None},
+        {"entity_id": "A-1", "name": "Nat King Cole", "subtype": "urn:entity:artist", "image_url": "https://img.example/nat.jpg"},
+    ]
+    session_id, headers = _open(client, "bio@example.com")
+    _drive_to_preview(client, session_id, headers)
+    preview = client.post(f"/sessions/{session_id}/preview", headers=headers)
+    assert preview.status_code == 200, preview.text
+    cards = _get(client, session_id, headers)["cards"]
+    names = [card["name"] for card in cards]
+    assert "World War II Documentary Collection" not in names
+    assert "Nat King Cole" in names
+    text = json.dumps(cards)
+    assert "biography" not in text
+    assert "description" not in text
+    assert "Sunday records" not in text
+
+
+def test_ratings_one_to_five_stay_in_range(client):
+    session_id, headers = _open(client, "rate-bounds@example.com")
+    view = _get(client, session_id, headers)
+    card_id = view["cards"][0]["card_id"]
+    for bad in (0, 6, -1):
+        refused = client.post(
+            f"/sessions/{session_id}/ratings",
+            json={"card_id": card_id, "score": bad},
+            headers=headers,
+        )
+        assert refused.status_code == 422, (bad, refused.text)
+    missing = client.post(
+        f"/sessions/{session_id}/ratings",
+        json={"card_id": "c_notondesk", "score": 3},
+        headers=headers,
+    )
+    assert missing.status_code == 404
+    stored = client.post(
+        f"/sessions/{session_id}/ratings",
+        json={"card_id": card_id, "score": 3},
+        headers=headers,
+    )
+    assert stored.status_code == 200, stored.text
+    body = stored.json()
+    assert body["stored"] is True
+    assert body["card_id"] == card_id
+    assert body["score"] == 3
+    assert body["reply"]
+    assert set(body["leans"]) == {"music", "film", "place"}
+
+
+def test_rating_narrows_signals_without_exclusions_or_unsigning(client, fake_qloo):
+    session_id, headers = _open(client, "narrow@example.com")
+    _drive_to_preview(client, session_id, headers)
+    preview = client.post(f"/sessions/{session_id}/preview", headers=headers)
+    assert preview.status_code == 200, preview.text
+    view = _get(client, session_id, headers)
+    cards = view["cards"]
+    assert cards and all(card["source"] == "qloo" for card in cards)
+
+    def insights_calls():
+        return [call for call in fake_qloo.calls if call[0] == "insights"]
+
+    before_calls = len(insights_calls())
+    keep = cards[-1]
+    raise_score = client.post(
+        f"/sessions/{session_id}/ratings",
+        json={"card_id": keep["card_id"], "score": 5},
+        headers=headers,
+    )
+    assert raise_score.status_code == 200, raise_score.text
+    saved = raise_score.json()
+    assert saved["score"] == 5
+    assert saved["reply"].startswith("Kept.")
+
+    stored = client.app.state.store.get(session_id)
+    exclusions_after_keep = json.dumps(stored["exclusions"])
+    previewed_after_keep = stored["previewed_at"]
+    assert "Nat King Cole" not in exclusions_after_keep or keep["name"] not in exclusions_after_keep
+    assert stored["sealed"] is not True
+
+    # A 1 demotes without writing exclusions or clearing previewed_at.
+    demote_target = cards[0]
+    lowered = client.post(
+        f"/sessions/{session_id}/ratings",
+        json={"card_id": demote_target["card_id"], "score": 1},
+        headers=headers,
+    )
+    assert lowered.status_code == 200, lowered.text
+    assert lowered.json()["reply"].startswith("Noted.")
+
+    stored = client.app.state.store.get(session_id)
+    assert json.dumps(stored["exclusions"]) == exclusions_after_keep
+    assert stored["previewed_at"] == previewed_after_keep
+    assert not stored.get("sealed")
+
+    # The next insights request carries the promoted entity id.
+    refreshed = _get(client, session_id, headers)
+    assert 2 <= len(refreshed["cards"]) <= 5
+    latest = insights_calls()[-1]
+    assert len(insights_calls()) > before_calls
+    assert keep["entity_id"] in latest[3]
+    assert demote_target["entity_id"] not in latest[3]
+    demoted_names = [card["name"] for card in refreshed["cards"]]
+    assert demote_target["name"] not in demoted_names
+
+
+def test_rating_a_typed_phrase_down_keeps_it_out_of_the_signal(client, fake_qloo):
+    session_id, headers = _open(client, "phrase-down@example.com")
+    first = _say(client, session_id, headers, "gardening")
+    jazz_card = next(card for card in first["cards"] if card["phrase"] == "gardening")
+    _say(client, session_id, headers, "Sunday records after lunch.")
+    _say(client, session_id, headers, "none")
+
+    dropped = client.post(
+        f"/sessions/{session_id}/ratings",
+        json={"card_id": jazz_card["card_id"], "score": 2},
+        headers=headers,
+    )
+    assert dropped.status_code == 200, dropped.text
+
+    view = _get(client, session_id, headers)
+    phrases = [card.get("phrase") for card in view["cards"]]
+    assert "gardening" not in phrases
+    stored = client.app.state.store.get(session_id)
+    assert stored["uploads"][0]["interests"] == []
+    assert "gardening" not in json.dumps(stored["interview"]["interests"])
+    assert stored["exclusions"] == []
+
+
+def test_full_chat_path_to_candidates_and_feedback(client, fake_qloo):
     created = client.post(
         "/accounts",
         json={"email": "ada@example.com", "password": "test-password-1"},
@@ -104,30 +280,8 @@ def test_interview_commits_without_insights_and_stores_feedback(client, fake_qlo
     assert invite.status_code == 201, invite.text
     session_id = invite.json()["session_id"]
     headers = {"X-Invite-Token": invite.json()["invite_token"]}
-    samples = _short_answers()
-    guard = 0
-    while True:
-        guard += 1
-        assert guard < 20
-        view = client.get(f"/sessions/{session_id}/interview", headers=headers)
-        assert view.status_code == 200, view.text
-        body = view.json()
-        if body["committed"]:
-            break
-        if body["can_exit"]:
-            turned = client.post(
-                f"/sessions/{session_id}/interview",
-                json={"exit": True},
-                headers=headers,
-            )
-        else:
-            probe_id = body["probe"]["id"]
-            turned = client.post(
-                f"/sessions/{session_id}/interview",
-                json={"text": samples[probe_id]},
-                headers=headers,
-            )
-        assert turned.status_code == 200, turned.text
+    committed = _drive_to_preview(client, session_id, headers)
+    assert committed["committed"] is True
     assert not any(call[0] == "insights" for call in fake_qloo.calls)
 
     early = client.post(
@@ -169,11 +323,56 @@ def test_interview_commits_without_insights_and_stores_feedback(client, fake_qlo
     stored = json.dumps(client.app.state.accounts.read_all())
     assert "test-password-1" not in stored
     assert "It felt like her." in stored
-    assert "gardening" in stored or "jazz" in stored
+    assert "jazz" in stored
     session = client.app.state.store.get(session_id)
     assert session["feedback"]["fit"] == "It felt like her."
     assert session["feedback"]["next"] == "Ask about Sunday sooner."
+    assert session["uploads"][0]["anecdote"] == ""
     assert session["uploads"][0]["photo_path"] == ""
+
+
+def test_bare_ping_after_the_preview_returns_fresh_cards(client, fake_qloo):
+    session_id, headers = _open(client, "ping@example.com")
+    _drive_to_preview(client, session_id, headers)
+    preview = client.post(f"/sessions/{session_id}/preview", headers=headers)
+    assert preview.status_code == 200, preview.text
+    before = _get(client, session_id, headers)
+    turn_count = len(before["turns"])
+    assert before["cards"]
+
+    pinged = client.post(
+        f"/sessions/{session_id}/interview",
+        json={"text": ""},
+        headers=headers,
+    )
+    assert pinged.status_code == 200, pinged.text
+    body = pinged.json()
+    assert body["reply"] == "Here are more suggestions."
+    assert len(body["turns"]) == turn_count
+    assert 2 <= len(body["cards"]) <= 5
+
+
+def test_moment_and_leave_out_are_frozen_after_commit(client):
+    session_id, headers = _open(client, "frozen@example.com")
+    _drive_to_preview(client, session_id, headers)
+    moment = client.post(
+        f"/sessions/{session_id}/interview",
+        json={"slot": "moment", "text": "A different Sunday."},
+        headers=headers,
+    )
+    assert moment.status_code == 409
+    leave = client.post(
+        f"/sessions/{session_id}/interview",
+        json={"slot": "leave_out", "text": "nothing at all"},
+        headers=headers,
+    )
+    assert leave.status_code == 409
+
+
+def test_invites_require_an_account(client):
+    response = client.post("/invites", json={"caregiver_label": "Ada"})
+    assert response.status_code == 401
+    assert "password" not in response.text.lower()
 
 
 def test_sign_in_is_refused_when_unconfigured(tmp_path, fake_qloo):
@@ -270,9 +469,7 @@ def test_the_account_cookie_is_secure_behind_https(client):
 def test_a_sitting_stays_on_the_account_that_opened_it(client):
     from fastapi.testclient import TestClient
 
-    from conftest import start_session
-
-    session_id, headers = start_session(client)
+    session_id, headers = _open(client, "owner@example.com")
     stranger = TestClient(client.app)
     created = stranger.post(
         "/accounts",
@@ -295,13 +492,17 @@ def test_dev_sample_stops_before_the_list(client, fake_qloo):
     assert body["phase"] == "preview"
     assert body["caregiver_label"] == "Asha (daughter)"
     headers = {"X-Invite-Token": body["invite_token"]}
+    view = client.get(f"/sessions/{body['session_id']}/interview", headers=headers)
+    assert view.status_code == 200, view.text
+    assert view.json()["phase"] == "preview"
     blocked = client.post(f"/sessions/{body['session_id']}/candidates", headers=headers)
     assert blocked.status_code == 409
     assert not any(call[0] == "insights" for call in fake_qloo.calls)
 
 
 def test_persona_summary_from_sample_answers():
-    built = materialize(_short_answers())
+    state = normalize_interview({"answers": _short_answers()})
+    built = materialize(state)
     portrait = persona_summary(
         interests=built["interests"],
         habits=built["habits"],
@@ -319,8 +520,39 @@ def test_persona_summary_from_sample_answers():
     assert "music" in portrait["qloo_plain"].casefold()
 
 
+def test_legacy_answers_upgrade_to_the_chat_shape():
+    state = normalize_interview({"answers": _short_answers()})
+    assert state["moment"] == "Sunday records after lunch."
+    assert state["leave_out"] == "war documentaries"
+    phrases = [item["phrase"] for item in state["interests"]]
+    # Music and film land before hobby overflow; habit probes are dropped.
+    assert phrases.index("jazz") < phrases.index("gardening")
+    assert "late morning" not in phrases
+    built = materialize(state)
+    assert "war documentaries" in built["exclusions"]
+    assert "none" not in built["exclusions"]
+
+
+def _short_answers():
+    return {
+        "hands": "gardening",
+        "place": "the kitchen",
+        "moment": "Sunday records after lunch.",
+        "music": "jazz",
+        "music_more": "Nat King Cole",
+        "film": "musicals",
+        "film_more": "Singin in the Rain",
+        "when": "late morning",
+        "span": "a few songs",
+        "company": "her daughter",
+        "leave_out": "war documentaries",
+        "leave_more": "none",
+    }
+
+
 def test_acknowledge_quotes_their_words():
     assert acknowledge("gardening") == 'I\'ll keep "gardening."'
+    assert acknowledge("Sunday records after lunch.") == 'I\'ll keep "Sunday records after lunch."'
     assert acknowledge("  none  ") == "I'll leave that as none."
     assert acknowledge("skip") == "I'll leave that as none."
     clipped = acknowledge("word " * 40)
@@ -337,18 +569,21 @@ def test_persona_summary_does_not_invent_from_empty():
 
 def test_materialize_keeps_music_and_film_when_hands_fill_early_slots():
     """Hobby comma-lists must not zero out later music/film probe answers."""
-    built = materialize(
+    state = normalize_interview(
         {
-            "hands": (
-                "Dogs, Detallado Inteligente Motorcyles, Music, Audiophile, "
-                "Cooking, Woodworking supply store"
-            ),
-            "place": "Garage, Colombo",
-            "moment": "An ordinary afternoon.",
-            "music": "Named Singer One, Named Band Two, Named Song Three",
-            "film": "Named Film One, Named Film Two",
+            "answers": {
+                "hands": (
+                    "Dogs, Detallado Inteligente Motorcyles, Music, Audiophile, "
+                    "Cooking, Woodworking supply store"
+                ),
+                "place": "Garage, Colombo",
+                "moment": "An ordinary afternoon.",
+                "music": "Named Singer One, Named Band Two, Named Song Three",
+                "film": "Named Film One, Named Film Two",
+            }
         }
     )
+    built = materialize(state)
     interests = built["interests"]
     for name in (
         "Named Singer One",
