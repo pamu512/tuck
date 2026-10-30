@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Tuck</title>
   <meta name="description" content="Tuck asks the person who is helping, one question at a time, then makes a private listening gift.">
-  <meta name="theme-color" content="#f6f1e7">
+  <meta name="theme-color" content="#b08968">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,560;9..144,640&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
@@ -19,20 +19,38 @@
       <button type="button" class="secondary" id="sign-out" hidden>Sign out</button>
     </header>
 
+    <aside id="scene" class="scene" aria-label="Who this listening is for">
+      <p class="scene-kicker" id="scene-kicker">Listening for</p>
+      <p class="scene-name" id="scene-name">Someone you love</p>
+      <p class="scene-moment" id="scene-moment" hidden></p>
+      <img id="scene-photo" class="scene-photo" alt="" hidden>
+    </aside>
+
+    <div class="room">
     <main id="desk">
       <p id="status" class="status" role="status"></p>
       <p id="error" class="error" role="alert" hidden></p>
       <ol id="transcript" class="transcript" aria-label="What we have said" tabindex="0"></ol>
-      <h1 id="ask" tabindex="-1">What email should I use for your account?</h1>
-      <p id="aside" class="lede">I'm Tuck. You are helping someone. I ask one thing at a time, including what should stay out. I show you the list before anything goes to Spotify. You can save a private playlist, or take the listening file.</p>
+      <h1 id="ask" tabindex="-1">Build a private listening gift for someone you love</h1>
+      <p id="aside" class="lede">Tuck asks one thing at a time, including what should stay out. You see the list before anything goes to Spotify.</p>
+
+      <section id="landing">
+        <div class="actions">
+          <button type="button" class="primary" id="sample">Open the sample family</button>
+        </div>
+        <p class="hint" id="not-therapy">Start without an account. This is shared listening and looking. It is not therapy, and it does not treat anything.</p>
+        <div class="actions">
+          <button type="button" class="secondary" id="show-account">I have an account</button>
+        </div>
+      </section>
 
       <section id="cards" hidden aria-label="Suggestions to rate"></section>
 
-      <form id="form-email" class="card">
+      <form id="form-email" class="card" hidden>
         <label for="email">Email</label>
         <input id="email" name="email" type="email" autocomplete="username" required maxlength="120" inputmode="email">
         <div class="actions">
-          <button class="primary" type="submit">Send</button>
+          <button class="primary" type="submit">Continue</button>
         </div>
       </form>
 
@@ -48,7 +66,7 @@
         <input id="password" name="password" type="password" autocomplete="new-password" required minlength="10" maxlength="200">
         <p class="hint">At least 10 characters.</p>
         <div class="actions">
-          <button class="primary" type="submit">Send</button>
+          <button class="primary" type="submit">Continue</button>
         </div>
       </form>
 
@@ -56,7 +74,7 @@
         <label for="who">Their name</label>
         <input id="who" name="who" type="text" autocomplete="off" required maxlength="60">
         <div class="actions">
-          <button class="primary" type="submit">Send</button>
+          <button class="primary" type="submit">Continue</button>
         </div>
       </form>
 
@@ -75,7 +93,7 @@
           <button type="button" class="secondary" id="looking-skip">Skip the photo</button>
         </div>
         <div class="leans" id="leans" hidden>
-          <p class="hint" id="lean-hint">Adding more they love? Pick a lean, then send.</p>
+          <p class="hint" id="lean-hint">Adding more they love? Pick a lean, then continue.</p>
           <div class="actions" role="group" aria-label="Lean for what you send">
             <button type="button" class="secondary chip" id="lean-music" aria-pressed="false">Music</button>
             <button type="button" class="secondary chip" id="lean-film" aria-pressed="false">Film</button>
@@ -86,13 +104,13 @@
         <textarea id="answer" name="answer" rows="3" maxlength="600"></textarea>
         <div class="actions">
           <button type="button" class="secondary" id="mic" hidden>Speak, then edit</button>
-          <button class="primary" type="submit" id="send">Send</button>
+          <button class="primary" type="submit" id="send">Continue</button>
         </div>
       </form>
 
-      <div id="preview-actions" hidden>
+      <div id="preview-actions" class="pin" hidden>
         <div class="actions">
-          <button type="button" class="primary" id="build-preview">Show the preview</button>
+          <button type="button" class="primary" id="build-preview">Show listening preview</button>
         </div>
       </div>
       <article id="preview-sheet" class="sheet" hidden></article>
@@ -109,21 +127,15 @@
         <label for="feedback">Your note</label>
         <textarea id="feedback" name="feedback" rows="3" maxlength="400" required></textarea>
         <div class="actions">
-          <button class="primary" type="submit" id="feedback-send">Send</button>
+          <button class="secondary" type="submit" id="feedback-send">Send the note</button>
         </div>
       </form>
     </main>
 
-    <details class="advanced">
-      <summary>Advanced</summary>
-      <p>A sample family. It still stops at the preview until you ask.</p>
-      <button type="button" class="secondary" id="sample">Open the sample family</button>
-    </details>
-
     <footer class="colophon">
       <p>Most sittings run from about half an hour to two hours. Stop when it stops being easy.</p>
-      <p>This is shared listening and looking. It is not therapy, and it does not treat anything.</p>
     </footer>
+    </div>
   </div>
   <noscript>
     <p>Tuck needs JavaScript for the conversation. The README has the command-line path.</p>

@@ -1,20 +1,27 @@
-"""The public root is Tuck: an account, then one question."""
+"""The public root is Tuck: the listening gift, then one question."""
 
 from pathlib import Path
 
 
-def test_root_is_tuck_account_first(client):
+def test_root_opens_on_the_listening_gift(client):
     response = client.get("/")
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     text = response.text
     assert "Tuck" in text
-    assert "What email should I use for your account?" in text
+    assert "Build a private listening gift for someone you love" in text
+    assert "Open the sample family" in text
+    assert text.index("Open the sample family") < text.index('id="form-email"')
+    assert 'id="form-email" class="card" hidden' in text
+    assert "What email should I use for your account?" not in text
+    assert "Start without an account" in text
     assert "Make this my account" in text
     assert "I have an account" in text
-    assert "<details" in text and "Advanced" in text
-    assert "Open the sample family" in text
-    assert text.index("Advanced") < text.index("Open the sample family")
+    assert "Show listening preview" in text
+    assert ">Continue<" in text
+    assert "A a " not in text
+    assert "urn:tag" not in text
+    assert 'id="scene"' in text
     assert 'id="transcript"' in text
     assert 'id="form-looking"' not in text
     assert "for a demo" not in text

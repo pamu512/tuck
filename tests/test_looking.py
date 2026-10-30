@@ -393,7 +393,17 @@ def test_looking_page_is_one_reply_and_an_optional_photo():
     assert "max-height: 22rem" in css
     assert "width: 100%" in css
     assert "overflow-wrap: anywhere" in css
-    assert "max-height: 16rem" in css
+    transcript_css = css.split(".transcript {", 1)[1].split("}", 1)[0]
+    assert "max-height" not in transcript_css
+    assert ".earlier" in css
+    assert "overflow-y: auto" in css
+    rate_block = js.split("function renderCards", 1)[1].split("function rateCard", 1)[0]
+    assert "a thing they love" not in js
+    assert "A ${kind}" not in js
+    assert "suggestion." not in rate_block
+    tech = js.split('className = "tech"', 1)[1].split("Signal ids", 1)[0]
+    assert "state.dev" in tech
+    assert "token !== listToken" in js
 
 
 def test_data_without_a_token_does_not_read_the_rules(client):

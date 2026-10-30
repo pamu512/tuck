@@ -1,23 +1,25 @@
 /* Tuck's room. ENERGY 2 / RHYTHM 2 / MOTION 1.
    Reading: a one-question sitting for a family caregiver, paper sleeve.
-   Paper #f6f1e7 and ink #241c16: daylight, type like a printed sleeve.
-   Accent #8c2f24: record-label red, on the sleeve rule, the primary button,
-   and the gift's track numbers (the reading order).
-   Fraunces: the question and the track names, a liner-note voice.
+   Ground #b08968: the wooden table. Sheets #ffffff sit on it so the
+   question is a page, not beige on beige.
+   Ink #1a120e: near-black, readable on the table and on the page.
+   Accent #7a261c: record-label maroon, only on the one primary button,
+   the sleeve rule, and the gift's track numbers.
+   Fraunces: the question, the person's name, and the track names.
    Source Sans 3: the answer, at a size that stays readable.
-   Shadow: the preview and the gift only, the page being handed over.
+   Shadow: the person scene and the gift only. Those are the pages in hand.
    Radius: 2px fields, 4px primary button.
    Fixed light theme: a living room, not a console.
-   Motion: focus and hover only. */
+   Motion: focus and hover only. No blur. */
 
 :root {
-  --paper: #f6f1e7;
-  --sheet: #fffaf3;
-  --ink: #241c16;
-  --accent: #8c2f24;
-  --accent-ink: #fffaf3;
-  --line: #5c4e43;
-  --rule: #d9cbb6;
+  --paper: #b08968;
+  --sheet: #ffffff;
+  --ink: #1a120e;
+  --accent: #7a261c;
+  --accent-ink: #ffffff;
+  --line: #3d322a;
+  --rule: #3d322a;
   --serif: "Fraunces", "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
   --sans: "Source Sans 3", "Segoe UI", sans-serif;
 }
@@ -42,9 +44,58 @@ body {
 }
 
 .page {
-  width: min(100% - 2rem, 40rem);
+  width: min(100% - 1.5rem, 40rem);
   margin: 0 auto;
   padding: 1.25rem 0 calc(2.5rem + env(safe-area-inset-bottom));
+}
+
+.room {
+  min-width: 0;
+}
+
+/* The person stays in view on every screen. On a phone it is a short
+   card above the question. On a wide screen it takes the empty side. */
+.scene {
+  margin: 0 0 1.25rem;
+  padding: 0.9rem 1rem 1rem;
+  background: var(--sheet);
+  color: var(--ink);
+  border: 2px solid var(--line);
+  box-shadow: 0 12px 28px rgba(26, 18, 14, 0.18);
+}
+
+.scene-kicker,
+.scene-name,
+.scene-moment {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.scene-kicker {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.scene-name {
+  margin-top: 0.2rem;
+  font-family: var(--serif);
+  font-size: clamp(1.35rem, 1.1rem + 1vw, 1.85rem);
+  font-weight: 560;
+  line-height: 1.2;
+}
+
+.scene-moment {
+  margin-top: 0.55rem;
+}
+
+.scene-photo {
+  display: block;
+  width: 100%;
+  max-height: 9rem;
+  margin-top: 0.75rem;
+  object-fit: contain;
+  background: var(--sheet);
+  border: 2px solid var(--line);
 }
 
 .skip {
@@ -106,17 +157,40 @@ h1:focus-visible {
 .transcript {
   list-style: none;
   margin: 0 0 1.25rem;
-  padding: 0 0.15rem 0 0;
+  padding: 0;
   display: flex;
   flex-direction: column;
   gap: 0.9rem;
-  max-height: 16rem;
-  overflow-x: hidden;
-  overflow-y: auto;
+  overflow: visible;
 }
 
 .transcript:empty {
   display: none;
+}
+
+/* Earlier turns scroll inside their own box, with padding so the first
+   line is a full line and not a clipped sliver. The latest exchange
+   stays outside that box. */
+.earlier {
+  list-style: none;
+  margin: 0.35rem 0 0;
+  padding: 0.35rem 0.15rem 0.35rem 0;
+  max-height: 12rem;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scroll-padding-top: 0.35rem;
+}
+
+.earlier .turn + .turn {
+  margin-top: 0.9rem;
+}
+
+.history summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font-weight: 600;
 }
 
 .turn {
@@ -153,7 +227,7 @@ h1:focus-visible {
   margin-top: 1rem;
   padding: 0.9rem 1rem 1.1rem;
   background: var(--sheet);
-  border: 1px solid var(--rule);
+  border: 2px solid var(--line);
 }
 
 .lede,
@@ -218,7 +292,7 @@ button.primary,
 a.button {
   background: var(--accent);
   color: var(--accent-ink);
-  border: 1px solid #6e241c;
+  border: 2px solid #5c1a14;
   border-radius: 4px;
 }
 
@@ -262,8 +336,11 @@ button:disabled {
   margin-top: 1.25rem;
   padding: 1.1rem 1rem 1.25rem;
   background: var(--sheet);
-  border: 1px solid var(--rule);
-  box-shadow: 0 18px 36px rgba(36, 28, 22, 0.08);
+  border: 2px solid var(--line);
+}
+
+.sheet.gift {
+  box-shadow: 0 12px 28px rgba(26, 18, 14, 0.18);
 }
 
 .sleeve {
@@ -420,10 +497,19 @@ button:disabled {
 
 .suggestion {
   margin: 0;
-  padding: 0.75rem 0.9rem 0.85rem;
-  background: var(--sheet);
-  border: 1px solid var(--rule);
-  border-radius: 2px 10px 10px 2px;
+  padding: 0.45rem 0 0.55rem;
+  background: transparent;
+  border: 0;
+  border-top: 2px solid var(--line);
+  border-radius: 0;
+}
+
+.rate-fold summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font-weight: 600;
 }
 
 .suggestion-name {
@@ -442,10 +528,9 @@ button:disabled {
 }
 
 .rate {
-  margin: 0.65rem 0 0;
-  padding: 0.35rem 0.5rem 0.5rem;
-  border: 1px solid var(--rule);
-  border-radius: 2px;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  border: 0;
   min-inline-size: 0;
 }
 
@@ -456,6 +541,7 @@ button:disabled {
 }
 
 .rate-row {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   gap: 0.4rem;
@@ -486,7 +572,7 @@ button:disabled {
 
 .rate-row input:checked + label {
   background: var(--accent);
-  border-color: #6e241c;
+  border-color: #5c1a14;
   color: var(--accent-ink);
 }
 
@@ -501,8 +587,39 @@ button:disabled {
 
 .chip[aria-pressed="true"] {
   background: var(--accent);
-  border-color: #6e241c;
+  border-color: #5c1a14;
   color: var(--accent-ink);
+}
+
+.song {
+  margin: 0.15rem 0 0;
+  font-family: var(--serif);
+  font-size: 1.05rem;
+}
+
+.pin {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  margin-top: 0.5rem;
+  background: var(--paper);
+  padding-bottom: calc(0.35rem + env(safe-area-inset-bottom));
+}
+
+body.is-gift #transcript,
+body.is-gift #cards,
+body.is-gift #form-answer,
+body.is-gift #preview-actions,
+body.is-gift #preview-sheet,
+body.is-gift #landing,
+body.is-gift #aside,
+body.is-gift #list-actions,
+body.is-gift #form-feedback {
+  display: none !important;
+}
+
+body.is-gift #form-feedback.is-open {
+  display: block !important;
 }
 
 @media (min-width: 40rem) {
@@ -518,6 +635,31 @@ button:disabled {
     grid-template-columns: 1fr 1fr;
     gap: 1.5rem;
     align-items: start;
+  }
+}
+
+@media (min-width: 64rem) {
+  .page {
+    width: min(100% - 3rem, 70rem);
+    display: grid;
+    grid-template-columns: minmax(16rem, 20rem) minmax(0, 42rem);
+    column-gap: 2.5rem;
+    align-items: start;
+    justify-content: center;
+  }
+
+  .mast {
+    grid-column: 1 / -1;
+  }
+
+  .scene {
+    position: sticky;
+    top: 1.25rem;
+    margin: 0;
+  }
+
+  .scene-photo {
+    max-height: 16rem;
   }
 }
 

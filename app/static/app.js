@@ -21,7 +21,10 @@ const state = {
   lean: null,
   feedbackId: null,
   busy: false,
+  dev: new URLSearchParams(window.location.search).get("dev") === "1",
 };
+
+let listToken = 0;
 
 const askEl = document.getElementById("ask");
 const asideEl = document.getElementById("aside");
@@ -30,6 +33,7 @@ const errorEl = document.getElementById("error");
 const desk = document.getElementById("desk");
 const signOut = document.getElementById("sign-out");
 const forms = {
+  landing: document.getElementById("landing"),
   email: document.getElementById("form-email"),
   choice: document.getElementById("account-choice"),
   password: document.getElementById("form-password"),
@@ -152,8 +156,6 @@ function clearTranscript() {
   if (list) list.replaceChildren();
 }
 
-const KIND_LABELS = { music: "music", film: "film", place: "place", thing: "a thing they love" };
-
 function rateReply(card, score) {
   if (score >= 4) return `Kept. ${card.name} shapes what I ask for next.`;
   if (score <= 2) return `Noted. I will steer away from ${card.name}. Nothing was added to what stays out.`;
@@ -164,33 +166,35 @@ function renderCards(view) {
   const host = document.getElementById("cards");
   if (!host) return;
   host.replaceChildren();
-  const cards = (view && view.cards) || [];
+  const cards = ((view && view.cards) || []).filter((card) => card && card.card_id && String(card.name || "").trim());
   if (!cards.length) {
     host.hidden = true;
     return;
   }
   host.hidden = false;
-  if (view.rate_hint) add(host, "p", view.rate_hint, "rate-hint");
-  if (view.card_note) add(host, "p", view.card_note, "card-note");
-  const list = add(host, "ul", null, "suggestions");
+  const fold = document.createElement("details");
+  fold.className = "rate-fold";
+  const summary = document.createElement("summary");
+  summary.textContent = "Rate these if you want";
+  fold.appendChild(summary);
+  if (view.rate_hint) add(fold, "p", view.rate_hint, "rate-hint");
+  if (view.card_note) add(fold, "p", view.card_note, "card-note");
+  const list = add(fold, "ul", null, "suggestions");
   cards.forEach((card) => {
-    if (!card || !card.card_id) return;
     const item = add(list, "li", null, "suggestion");
-    add(item, "p", card.name || "", "suggestion-name");
+    add(item, "p", card.name, "suggestion-name");
     if (card.why) add(item, "p", card.why, "why");
-    const kind = KIND_LABELS[card.kind] || card.kind || "";
-    if (kind) add(item, "p", `A ${kind} suggestion.`, "meta");
     const field = document.createElement("fieldset");
     field.className = "rate";
     const legend = document.createElement("legend");
-    legend.textContent = `Rate ${card.name || "this"} from 1 to 5`;
+    legend.textContent = `Rate ${card.name} from 1 to 5`;
     field.appendChild(legend);
     const row = add(field, "div", null, "rate-row");
     for (let score = 1; score <= 5; score += 1) {
       const id = `rate-${card.card_id}-${score}`;
       const input = document.createElement("input");
-      input.type = "radio";
       input.name = `rate-${card.card_id}`;
+      input.type = "radio";
       input.value = String(score);
       input.id = id;
       const label = document.createElement("label");
@@ -198,10 +202,13 @@ function renderCards(view) {
       label.textContent = String(score);
       row.append(input, label);
     }
-    field.addEventListener("change", (event) => rateCard(card, Number(event.target.value)));
+    field.addEventListener("change", (event) => {
+      const score = Number(event.target && event.target.value);
+      if (score >= 1 && score <= 5) rateCard(card, score);
+    });
     item.appendChild(field);
   });
-  list.scrollTop = list.scrollHeight;
+  host.appendChild(fold);
 }
 
 async function rateCard(card, score) {
@@ -214,6 +221,12 @@ async function rateCard(card, score) {
       body: { card_id: card.card_id, score },
     });
     setStatus((saved && saved.reply) || rateReply(card, score));
+    try {
+      const view = await api(`/sessions/${state.sessionId}/interview`, { token: state.token });
+      renderCards(view);
+    } catch (refreshErr) {
+      setError(refreshErr.message);
+    }
   } catch (err) {
     setError(err.message);
   } finally {
@@ -221,30 +234,46 @@ async function rateCard(card, score) {
   }
 }
 
+function turnNode(turn, view) {
+  const item = document.createElement("li");
+  item.className = "turn";
+  const tuck = document.createElement("p");
+  tuck.className = "tuck";
+  tuck.textContent = turn.ask || "";
+  const mine = document.createElement("p");
+  mine.className = "mine";
+  mine.textContent = turn.answer || "";
+  item.append(tuck, mine);
+  if (turn.id === "moment" && view.photo_attached) {
+    const note = document.createElement("p");
+    note.className = "tuck";
+    note.textContent = "A photo is saved with that moment. I did not open it.";
+    item.append(note);
+  }
+  return item;
+}
+
 function renderTranscript(view) {
   const list = document.getElementById("transcript");
   if (!list) return;
   list.replaceChildren();
-  (view.turns || []).forEach((turn) => {
-    if (!turn) return;
-    const item = document.createElement("li");
-    item.className = "turn";
-    const tuck = document.createElement("p");
-    tuck.className = "tuck";
-    tuck.textContent = turn.ask || "";
-    const mine = document.createElement("p");
-    mine.className = "mine";
-    mine.textContent = turn.answer || "";
-    item.append(tuck, mine);
-    if (turn.id === "moment" && view.photo_attached) {
-      const note = document.createElement("p");
-      note.className = "tuck";
-      note.textContent = "A photo is saved with that moment. I did not open it.";
-      item.append(note);
-    }
-    list.append(item);
-  });
-  list.scrollTop = list.scrollHeight;
+  const turns = (view.turns || []).filter(Boolean);
+  if (!turns.length) return;
+  if (turns.length > 1) {
+    const earlier = document.createElement("li");
+    earlier.className = "history";
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = "Earlier in this sitting";
+    details.appendChild(summary);
+    const older = document.createElement("ol");
+    older.className = "earlier";
+    turns.slice(0, -1).forEach((turn) => older.appendChild(turnNode(turn, view)));
+    details.appendChild(older);
+    earlier.appendChild(details);
+    list.appendChild(earlier);
+  }
+  list.appendChild(turnNode(turns[turns.length - 1], view));
 }
 
 async function api(path, { method = "GET", body = null, token = null, timeoutMs = 0, form = null } = {}) {
@@ -317,15 +346,63 @@ function hideCards() {
 }
 
 function showAsk(text, panel) {
+  document.body.classList.remove("is-gift");
   askEl.textContent = text;
   hideAll();
-  if (panel === forms.email) {
+  if (panel === forms.email || panel === forms.landing) {
     clearTranscript();
     hideCards();
   }
   if (panel) panel.hidden = false;
   setError("");
   focusAsk();
+}
+
+function showLanding() {
+  asideEl.hidden = false;
+  signOut.hidden = true;
+  setScene({});
+  showAsk("Build a private listening gift for someone you love", forms.landing);
+  const sample = document.getElementById("sample");
+  if (sample) sample.focus();
+}
+
+function setScene(view) {
+  const source = view || {};
+  const name = String(source.caregiver_label || source.name || state.personName || "").trim();
+  const moment = String(source.moment || "").trim();
+  const photo = source.photo_href || source.photo || "";
+  const kicker = document.getElementById("scene-kicker");
+  const nameEl = document.getElementById("scene-name");
+  const momentEl = document.getElementById("scene-moment");
+  const photoEl = document.getElementById("scene-photo");
+  if (kicker) kicker.textContent = name ? "Listening for" : "For";
+  if (nameEl) nameEl.textContent = name || "Someone you love";
+  if (momentEl) {
+    momentEl.textContent = moment;
+    momentEl.hidden = !moment;
+  }
+  if (!photoEl) return;
+  if (photo && photoProvided(photo)) {
+    photoEl.hidden = false;
+    photoEl.alt = name ? `Photo saved for ${name}` : "Photo saved for this sitting";
+    if (photoEl.getAttribute("src") !== photo) photoEl.src = photo;
+    photoEl.onerror = () => {
+      photoEl.hidden = true;
+      photoEl.removeAttribute("src");
+    };
+  } else {
+    photoEl.hidden = true;
+    photoEl.removeAttribute("src");
+  }
+}
+
+function tuneSend(phase) {
+  const send = document.getElementById("send");
+  if (!send) return;
+  const chatting = phase === "chat";
+  send.textContent = chatting ? "Continue" : "Add another detail";
+  send.className = chatting ? "primary" : "secondary";
 }
 
 function rememberSession(sessionId, token) {
@@ -341,6 +418,8 @@ function clearSession() {
   state.slot = null;
   state.lean = null;
   state.feedbackId = null;
+  state.personName = "";
+  state.email = "";
   sessionStorage.removeItem("tuck_session");
   sessionStorage.removeItem("tuck_token");
 }
@@ -393,13 +472,15 @@ async function showInterview() {
   renderCards(view);
   asideEl.hidden = true;
   signOut.hidden = false;
+  setScene(view);
+  tuneSend(view.phase);
   const attach = document.getElementById("looking-attach");
   const leans = document.getElementById("leans");
   if (view.phase === "chat") {
     state.slot = view.slot;
     if (attach) attach.hidden = view.slot !== "moment";
     if (view.slot === "moment") document.getElementById("photo").value = "";
-    if (leans) leans.hidden = false;
+    if (leans) leans.hidden = view.slot !== "interest";
     showAsk(view.asked, forms.answer);
     document.getElementById("answer").value = "";
     if (view.slot === "moment") syncLookingSend();
@@ -408,7 +489,7 @@ async function showInterview() {
   state.slot = null;
   setLean(null);
   if (attach) attach.hidden = true;
-  if (leans) leans.hidden = true;
+  if (leans) leans.hidden = view.phase !== "preview";
   if (view.phase === "preview") {
     showAsk(view.asked, forms.previewActions);
     // The chat keeps going: more names can still be sent.
@@ -424,7 +505,7 @@ async function showInterview() {
 
 async function showPreview(opts = {}) {
   const resume = Boolean(opts.resume);
-  setStatus(resume ? "Opening the preview again." : "Building the preview.");
+  setStatus(resume ? "Opening the listening preview again." : "Building the listening preview.");
   const preview = await api(`/sessions/${state.sessionId}/preview`, {
     method: "POST",
     token: state.token,
@@ -467,6 +548,14 @@ async function showPreview(opts = {}) {
     }
     sheet.appendChild(fig);
   });
+  const firstLook = (Array.isArray(preview.looking) ? preview.looking : []).find(
+    (item) => item && photoProvided(item.photo_href)
+  );
+  setScene({
+    caregiver_label: preview.caregiver_label || state.personName,
+    moment: (firstLook && firstLook.anecdote) || ((preview.anecdotes || [])[0] || ""),
+    photo_href: firstLook ? firstLook.photo_href : "",
+  });
   if (preview.qloo_plain) {
     add(sheet, "h2", "What I would ask for");
     add(sheet, "p", preview.qloo_plain);
@@ -486,7 +575,7 @@ async function showPreview(opts = {}) {
     add(
       sheet,
       "p",
-      "I could not match enough of what you named to ask for a list yet. Add a singer, a film, or another clear name, then show the preview again."
+      "I could not match enough of what you named to ask for a list yet. Add a singer, a film, or another clear name, then show the listening preview again."
     );
   }
 
@@ -503,8 +592,11 @@ async function showPreview(opts = {}) {
   if (unresolved.length) {
     add(left, "p", `I could not match: ${unresolved.join(", ")}. Those words stay out of the request.`);
   }
-  if (signals.length) {
-    add(left, "p", `Matched for the request: ${signals.map((s) => s.name).filter(Boolean).join(", ")}.`);
+  const matched = signals
+    .map((item) => item && item.name)
+    .filter((name) => name && String(name).indexOf("urn:") !== 0);
+  if (matched.length) {
+    add(left, "p", `Matched for the request: ${matched.join(", ")}.`);
   }
   const right = add(grid, "div");
   add(right, "h2", "Left out");
@@ -523,8 +615,10 @@ async function showPreview(opts = {}) {
   if (preview.what_qloo_receives && preview.what_qloo_receives.note) {
     add(details, "p", preview.what_qloo_receives.note);
   }
-  const ids = (preview.what_qloo_receives && preview.what_qloo_receives.signal_ids) || [];
-  if (ids.length) add(details, "p", `Signal ids: ${ids.join(", ")}.`);
+  if (state.dev) {
+    const ids = (preview.what_qloo_receives && preview.what_qloo_receives.signal_ids) || [];
+    if (ids.length) add(details, "p", `Signal ids: ${ids.join(", ")}.`);
+  }
   sheet.appendChild(details);
   setStatus("");
   askBtn.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -533,14 +627,13 @@ async function showPreview(opts = {}) {
 
 async function requestList() {
   if (state.busy) return;
+  const token = ++listToken;
   setBusy(true);
   setError("");
   setStatus("Asking for the list. This can take up to a couple of minutes.");
   const progress = window.setInterval(() => {
-    if (!state.busy) return;
-    if (statusEl.textContent.indexOf("still working") === -1) {
-      setStatus("Still working on the list. Stay on this page.");
-    }
+    if (token !== listToken || !state.busy) return;
+    setStatus("Still working on the list. Stay on this page.");
   }, 8000);
   try {
     await api(`/sessions/${state.sessionId}/candidates`, {
@@ -548,7 +641,9 @@ async function requestList() {
       token: state.token,
       timeoutMs: 120000,
     });
-    setStatus("The list is ready. Opening the listening gift.");
+    listToken += 1;
+    window.clearInterval(progress);
+    setStatus("");
     await showGift();
   } catch (err) {
     setError(err.message || "I could not finish the list. The preview is still here.");
@@ -564,9 +659,15 @@ async function requestList() {
   }
 }
 
-function trackTitle(track) {
-  if (track.title) return `${track.artist}: ${track.title}`;
-  return track.artist || "Untitled";
+function trackBits(track) {
+  const artist = String((track && track.artist) || "").trim() || "Untitled";
+  const title = String((track && track.title) || "").trim();
+  const why = String((track && track.why) || "").trim();
+  return {
+    artist,
+    title,
+    why: why.indexOf("urn:") === 0 ? "" : why,
+  };
 }
 
 async function showGift() {
@@ -579,7 +680,6 @@ async function showGift() {
   sheet.classList.add("gift");
   sheet.replaceChildren();
   sleeve(sheet);
-  add(sheet, "h2", `Listening for ${label}.`);
   add(sheet, "p", "Play these in order, somewhere quiet. Stop when it stops being easy. Most sittings run from about half an hour to two hours.");
   add(
     sheet,
@@ -591,11 +691,13 @@ async function showGift() {
   else {
     const list = add(sheet, "ol");
     tracks.forEach((track) => {
+      const bits = trackBits(track);
       const item = add(list, "li");
-      add(item, "p", trackTitle(track), "music-name");
-      if (track.why) add(item, "p", track.why, "why");
+      add(item, "p", bits.artist, "music-name");
+      if (bits.title) add(item, "p", bits.title, "song");
+      if (bits.why) add(item, "p", bits.why, "why");
       if (track.search_url) {
-        const link = add(item, "a", "Search this on Spotify");
+        const link = add(item, "a", "Search on Spotify");
         link.href = track.search_url;
         link.rel = "noopener noreferrer";
         link.target = "_blank";
@@ -608,15 +710,17 @@ async function showGift() {
   });
   if (labels.length) add(sheet, "p", `Left out: ${labels.join(", ")}.`);
   else add(sheet, "p", "You said nothing should be left out.");
-  if (plan.boundary) {
+  const boundary = String(plan.boundary || "").trim();
+  if (boundary) {
     const note = document.createElement("details");
     note.className = "tech";
     const summary = document.createElement("summary");
     summary.textContent = "What this listening is";
     note.appendChild(summary);
-    add(note, "p", plan.boundary);
+    add(note, "p", boundary);
     sheet.appendChild(note);
   }
+  document.body.classList.add("is-gift");
   const actions = forms.giftActions;
   actions.replaceChildren();
   actions.hidden = false;
@@ -626,7 +730,7 @@ async function showGift() {
     open.rel = "noopener noreferrer";
     open.target = "_blank";
   } else {
-    const save = add(actions, "button", "Save a private Spotify playlist");
+    const save = add(actions, "button", "Save private Spotify playlist");
     save.type = "button";
     save.className = "primary";
     save.addEventListener("click", () => connectSpotify());
@@ -635,15 +739,23 @@ async function showGift() {
   download.type = "button";
   download.className = "secondary";
   download.addEventListener("click", () => downloadGift());
-  if (statusEl.textContent === "Opening the listening gift.") setStatus("");
+  setStatus("");
   const sitting = await api(`/sessions/${state.sessionId}/interview`, { token: state.token });
+  setScene(sitting);
+  document.body.classList.add("is-gift");
   if (sitting.feedback_id && sitting.feedback_ask) {
     state.feedbackId = sitting.feedback_id;
-    askEl.textContent = sitting.feedback_ask;
-    forms.feedback.hidden = false;
-    forms.gift.hidden = false;
-    forms.giftActions.hidden = false;
-    document.getElementById("feedback").focus();
+    const note = add(actions, "button", "How did this list feel?");
+    note.type = "button";
+    note.className = "secondary";
+    note.addEventListener("click", () => {
+      askEl.textContent = sitting.feedback_ask;
+      forms.feedback.classList.add("is-open");
+      forms.feedback.hidden = false;
+      forms.gift.hidden = false;
+      forms.giftActions.hidden = false;
+      document.getElementById("feedback").focus();
+    });
   }
 }
 
@@ -876,9 +988,8 @@ async function sendReply(raw, { skipPhoto = false } = {}) {
   setStatus(looking ? "Saving that moment." : "Saving that.");
   try {
     const body = { text };
-    if (state.lean) {
+    if (state.lean && (state.slot === "interest" || state.slot === null)) {
       body.lean = state.lean;
-      body.slot = "interest";
     }
     await api(`/sessions/${state.sessionId}/interview`, {
       method: "POST",
@@ -951,11 +1062,15 @@ forms.feedback.addEventListener("submit", async (event) => {
     if (saved.pending) {
       state.feedbackId = saved.pending;
       showAsk(saved.ask, forms.feedback);
+      forms.feedback.classList.add("is-open");
       forms.gift.hidden = false;
       forms.giftActions.hidden = false;
+      document.body.classList.add("is-gift");
     } else {
       state.feedbackId = null;
       forms.feedback.hidden = true;
+      forms.feedback.classList.remove("is-open");
+      document.body.classList.add("is-gift");
       setStatus(saved.ask);
     }
   } catch (err) {
@@ -973,12 +1088,17 @@ signOut.addEventListener("click", async () => {
     /* The cookie clear is local even if the server is briefly down. */
   }
   clearSession();
-  signOut.hidden = true;
-  asideEl.hidden = false;
   document.getElementById("email").value = "";
-  showAsk("What email should I use for your account?", forms.email);
+  showLanding();
   setStatus("");
   setBusy(false);
+});
+
+document.getElementById("show-account").addEventListener("click", () => {
+  asideEl.hidden = true;
+  showAsk("What email should I use for your account?", forms.email);
+  const email = document.getElementById("email");
+  if (email) email.focus();
 });
 
 document.getElementById("sample").addEventListener("click", async () => {
@@ -1027,18 +1147,23 @@ async function resume() {
 async function boot() {
   setBusy(true);
   setStatus("One moment.");
+  let signedIn = false;
   try {
     const account = await api("/me");
+    signedIn = true;
     signOut.hidden = false;
+    if (forms.landing) forms.landing.hidden = true;
     const resumed = await resume();
     if (!resumed) await land(account);
   } catch (err) {
     const message = err.message || "";
     if (message.indexOf("Sign in") !== -1 || message.indexOf("not configured") !== -1) {
       clearSession();
+      signedIn = false;
     }
     if (message.indexOf("not configured") !== -1) setError(message);
-    showAsk("What email should I use for your account?", forms.email);
+    if (!signedIn) showLanding();
+    else if (message.indexOf("Sign in") === -1) setError(message || "I could not open the sitting.");
   } finally {
     playlistNotice();
     if (statusEl.textContent === "One moment.") setStatus("");

@@ -658,19 +658,46 @@ def filter_candidates(
     return kept, removed
 
 
-def candidate_reason(name: str, signals: list[dict[str, Any]]) -> str:
-    """Short why-line for one row. Never paste the full interest list."""
+_REASON_LINES = (
+    "Near {name}",
+    "Sits with {name}",
+    "Kept near {name}",
+)
+
+
+def candidate_reason(
+    name: str,
+    signals: list[dict[str, Any]],
+    *,
+    index: int = 0,
+) -> str:
+    """Short why-line for one row. Never paste the full interest list.
+
+    index walks the names you gave so a list does not stamp one sentence
+    on every row. A name that matches a signal stays an exact match.
+    """
     folded = name.casefold()
+    named: list[str] = []
+    seen: set[str] = set()
     for signal in signals:
-        if signal["name"].casefold() == folded:
-            return f"Matches what you named: {signal['name']}"
-    for signal in signals:
-        if signal.get("kind") == "entity":
-            return f"Near {signal['name']}"
-    for signal in signals:
-        if signal.get("kind") == "tag":
-            return f"Near {signal['name']}"
-    return ""
+        label = str(signal.get("name") or "").strip()
+        key = label.casefold()
+        if not label or key.startswith("urn:"):
+            continue
+        if key == folded:
+            return f"Matches what you named: {label}"
+        if key not in seen:
+            seen.add(key)
+            named.append(label)
+    if not named:
+        return ""
+    slot = index % len(named)
+    phrasing = (index // len(named)) % len(_REASON_LINES)
+    # Once every name and phrasing has been used, keep the line unique
+    # by naming the row. The first line stays "Near {name}".
+    if index >= len(named) * len(_REASON_LINES):
+        return f"{name} near {named[slot]}"
+    return _REASON_LINES[phrasing].format(name=named[slot])
 
 
 # --------------------------------------------------------------------------

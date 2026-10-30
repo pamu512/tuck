@@ -446,6 +446,7 @@ def create_app(
             if heard:
                 asked = f"{heard} {asked}"
         attached = False
+        photo_href = ""
         paths = [interview.get("photo_path")]
         for upload in session.get("uploads") or []:
             if isinstance(upload, dict):
@@ -454,6 +455,7 @@ def create_app(
             href = str(path or "").strip()
             if href.startswith("/data/") and photo_provided(href):
                 attached = True
+                photo_href = href
                 break
         cards, card_note = chat_cards(session, state)
         return {
@@ -468,7 +470,9 @@ def create_app(
             "can_preview": committed or preview_ready(state),
             "committed": committed,
             "turns": turns,
+            "moment": moment,
             "photo_attached": attached,
+            "photo_href": photo_href,
             "caregiver_label": session.get("caregiver_label") or "",
             "feedback_id": pending["id"] if pending else None,
             "feedback_ask": pending["ask"] if pending else None,
@@ -1270,8 +1274,8 @@ def create_app(
             session["agent_trace"] = trace
             session["previewed_at"] = domain.now_utc()
             store.put(session)
-            interview = session.get("interview") or {}
-            built = materialize(dict(interview.get("answers") or {}))
+            interview = session.get("interview") if isinstance(session.get("interview"), dict) else {}
+            built = materialize(normalize_interview(interview))
             persona = persona_summary(
                 interests=built.get("interests") or collect_interests_fallback(session),
                 habits=built.get("habits") or [],
@@ -1390,8 +1394,10 @@ def create_app(
                     detail="I could not finish the list. The preview is still here. Try again in a little while.",
                 )
             kept, removed = domain.filter_candidates(collected, session["exclusions"] or [])
-            for candidate in kept:
-                candidate["why"] = domain.candidate_reason(candidate["name"], kept_signals)
+            for index, candidate in enumerate(kept):
+                candidate["why"] = domain.candidate_reason(
+                    candidate["name"], kept_signals, index=index
+                )
             payload = domain.candidates_payload(session, kept, removed, types_failed)
             photo_hrefs = opaque_photo_hrefs(session)
             domain.seal_for_export(session, payload)

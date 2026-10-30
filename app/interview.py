@@ -468,11 +468,12 @@ def _lean_card(kind: str) -> dict[str, Any]:
 
 
 def local_cards(state: dict[str, Any]) -> list[dict[str, Any]]:
-    """2-5 local cards: the typed phrases, then music/film/place lean cards."""
+    """2-5 local cards: the newest typed phrases, then music/film/place lean cards."""
     leans = leans_of(state)
+    recent = phrases_of(state)[-MAX_PHRASE_CARDS:]
     cards = [
         _phrase_card(phrase, leans.get(phrase.casefold(), ""))
-        for phrase in reversed(phrases_of(state)[:MAX_PHRASE_CARDS])
+        for phrase in reversed(recent)
     ]
     for kind in LEAN_KINDS:
         if len(cards) >= 5:

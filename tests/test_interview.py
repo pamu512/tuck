@@ -5,6 +5,7 @@ import json
 from app.interview import (
     acknowledge,
     fresh_interview,
+    local_cards,
     materialize,
     next_slot,
     normalize_interview,
@@ -64,6 +65,16 @@ def test_preview_unlocks_on_interest_moment_and_leave_out():
     state["leave_out"] = "none"
     assert next_slot(state) is None
     assert preview_ready(state)
+
+
+def test_local_cards_show_the_newest_phrases():
+    state = fresh_interview()
+    for phrase in ("one", "two", "three", "four"):
+        store_interest_turn(state, phrase, "music", "t")
+    phrases = [card["phrase"] for card in local_cards(state) if card.get("phrase")]
+    assert phrases == ["four", "three", "two"]
+    assert "one" not in phrases
+    assert 2 <= len(local_cards(state)) <= 5
 
 
 def test_none_leave_out_counts_as_answered_not_as_exclusion():
@@ -139,6 +150,7 @@ def test_qloo_cards_carry_no_biography_and_respect_exclusions(client, fake_qloo)
     fake_qloo.catalog["urn:entity:artist"] = [
         {"entity_id": "A-9", "name": "World War II Documentary Collection", "subtype": "urn:entity:artist", "image_url": None},
         {"entity_id": "A-1", "name": "Nat King Cole", "subtype": "urn:entity:artist", "image_url": "https://img.example/nat.jpg"},
+        {"entity_id": "A-2", "name": "Miles Davis", "subtype": "urn:entity:artist", "image_url": None},
     ]
     session_id, headers = _open(client, "bio@example.com")
     _drive_to_preview(client, session_id, headers)
@@ -183,6 +195,50 @@ def test_ratings_one_to_five_stay_in_range(client):
     assert body["score"] == 3
     assert body["reply"]
     assert set(body["leans"]) == {"music", "film", "place"}
+
+
+def test_a_lean_does_not_reclassify_the_moment(client):
+    session_id, headers = _open(client, "lean-moment@example.com")
+    _say(client, session_id, headers, "jazz", lean="music")
+    turned = _say(client, session_id, headers, "Sunday records after lunch.", lean="film")
+    assert turned["slot"] == "leave_out"
+    stored = client.app.state.store.get(session_id)
+    phrases = [item["phrase"] for item in stored["interview"]["interests"]]
+    assert phrases == ["jazz"]
+    assert stored["interview"]["moment"] == "Sunday records after lunch."
+
+
+def test_preview_portrait_reads_the_chat_when_the_upload_anecdote_is_blank(client, fake_qloo):
+    session_id, headers = _open(client, "portrait@example.com")
+    _drive_to_preview(client, session_id, headers)
+    session = client.app.state.store.get(session_id)
+    session["uploads"][0]["anecdote"] = ""
+    session["interview"].pop("answers", None)
+    client.app.state.store.put(session)
+    preview = client.post(f"/sessions/{session_id}/preview", headers=headers)
+    assert preview.status_code == 200, preview.text
+    assert "Sunday" in preview.json()["persona_summary"]
+
+
+def test_ratings_stop_when_the_gift_is_sealed(client, fake_qloo):
+    session_id, headers = _open(client, "sealed-rate@example.com")
+    _drive_to_preview(client, session_id, headers)
+    preview = client.post(f"/sessions/{session_id}/preview", headers=headers)
+    assert preview.status_code == 200, preview.text
+    listed = client.post(f"/sessions/{session_id}/candidates", headers=headers)
+    assert listed.status_code == 200, listed.text
+    view = _get(client, session_id, headers)
+    card_id = view["cards"][0]["card_id"]
+    refused = client.post(
+        f"/sessions/{session_id}/ratings",
+        json={"card_id": card_id, "score": 4},
+        headers=headers,
+    )
+    assert refused.status_code == 409, refused.text
+    stored = client.app.state.store.get(session_id)
+    assert not stored.get("ratings")
+    assert stored["previewed_at"]
+    assert stored["exclusions"]
 
 
 def test_rating_narrows_signals_without_exclusions_or_unsigning(client, fake_qloo):
@@ -616,3 +672,19 @@ def test_candidate_reason_is_short_not_a_laundry_list():
         [{"name": "Named Singer One", "kind": "entity", "id": "E1", "interest": "Named Singer One"}],
     )
     assert direct.startswith("Matches what you named:")
+
+
+def test_candidate_reasons_do_not_repeat_one_line():
+    signals = [{"name": "Nat King Cole", "kind": "entity", "id": "e1", "interest": "Nat King Cole"}]
+    reasons = [candidate_reason(f"Artist {i}", signals, index=i) for i in range(6)]
+    assert reasons[0] == "Near Nat King Cole"
+    assert len(set(reasons)) == 6
+    assert all("," not in reason for reason in reasons)
+    mixed = [
+        {"name": "Nat King Cole", "kind": "entity", "id": "e1", "interest": "Nat King Cole"},
+        {"name": "jazz", "kind": "tag", "id": "urn:tag:genre:music:jazz", "interest": "jazz"},
+    ]
+    spread = [candidate_reason(f"Artist {i}", mixed, index=i) for i in range(6)]
+    assert len(set(spread)) == 6
+    assert spread[0].startswith("Near ")
+    assert "urn:" not in " ".join(spread)
